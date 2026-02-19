@@ -177,32 +177,32 @@ def _parse_shift_mode(value: int) -> ShiftMode:
 DS2_CMD_IDENT = 0x00      # ECU identification
 DS2_CMD_BLOCK = 0x04      # Block read
 DS2_CMD_STATUS = 0x05     # Status data
-DS2_CMD_ANALOG = 0x0D     # Analog channel data
+DS2_CMD_ANALOG = 0x0D     # Analog channel data (72 bytes)
 DS2_CMD_INFO = 0x0A       # Info data
 
 # SMG ECU address
 SMG_ECU_ADDR = 0x32
 
-# SMG data byte offsets (from command 0x0D response)
-# Based on testing and EdiabasLib documentation
+# SMG Analog data byte offsets (from command 0x0D response)
+# VERIFIED by live testing - 72 byte response
+# NOTE: Gear position only updates with engine running (hydraulic pressure needed)
 SMG_ANALOG_MAP = {
-    'status': 0,           # Status byte
-    'gear': 1,             # Current gear
-    'gear_requested': 2,   # Requested gear
-    'shift_mode': 3,       # Shift program (S1-S6, A)
-    'clutch_pos': 4,       # Clutch position
-    'hydraulic_high': 5,   # Hydraulic pressure high byte
-    'hydraulic_low': 6,    # Hydraulic pressure low byte
-    'gearbox_temp': 7,     # Gearbox temperature
-    'pump_status': 8,      # Pump running status
-    'shift_time_high': 9,  # Last shift time high
-    'shift_time_low': 10,  # Last shift time low
+    'gear': 0,             # Engaged gear (0=N, 1-6, 7=R) - NEEDS ENGINE RUNNING
+    'unknown_1': 1,        # Value 60 observed (temp related?)
+    'unknown_2': 2,        # Value 50 observed
+    # Bytes 3-44: Mostly 0xFF (masked/unused)
+    'shift_mode': 45,      # Shift program: 3=S3 CONFIRMED
+    'gearbox_temp': 46,    # Gearbox temperature (raw-40) = 87°C CONFIRMED
+    # Bytes 47-71: Additional sensor data
 }
 
 
 def get_smg_data_ds2(connection: 'DS2Connection') -> SMGData:
     """
     Read all available SMG II parameters using DS2 protocol.
+    
+    NOTE: Gear position only updates when engine is running.
+    With engine off, gear will always show Neutral (0).
     
     Args:
         connection: Active DS2Connection
@@ -213,23 +213,30 @@ def get_smg_data_ds2(connection: 'DS2Connection') -> SMGData:
     data = SMGData()
     
     try:
-        # Try analog data first (command 0x0D)
+        # Read analog data (command 0x0D) - 72 bytes
         response = connection.send(SMG_ECU_ADDR, DS2_CMD_ANALOG)
         
-        if response and response.valid and len(response.data) > 5:
+        if response and response.valid and len(response.data) >= 47:
             raw = response.data
-            logger.debug(f"SMG analog data: {raw.hex()}")
+            logger.debug(f"SMG analog data ({len(raw)} bytes): {raw.hex()}")
             
-            # Parse gear position
-            if len(raw) > 1:
-                gear_byte = raw[1] if raw[0] == 0xA0 else raw[0]  # Skip status if present
-                data.gear = _parse_gear(gear_byte & 0x0F)
-                
-            # Parse shift mode (may be in different position)
-            for i in range(min(5, len(raw))):
-                if 0 <= raw[i] <= 6:  # Valid shift mode range
-                    data.shift_mode = _parse_shift_mode(raw[i])
-                    break
+            # Gear position at byte 0 (only updates with engine running)
+            gear_byte = raw[SMG_ANALOG_MAP['gear']]
+            data.gear = _parse_gear(gear_byte)
+            logger.debug(f"SMG gear = {data.gear.name} (raw: {gear_byte})")
+            
+            # Shift mode at byte 45
+            if len(raw) > SMG_ANALOG_MAP['shift_mode']:
+                mode_byte = raw[SMG_ANALOG_MAP['shift_mode']]
+                data.shift_mode = _parse_shift_mode(mode_byte)
+                logger.debug(f"SMG shift mode = {data.shift_mode.name} (raw: {mode_byte})")
+            
+            # Gearbox temperature at byte 46 (raw - 40)
+            if len(raw) > SMG_ANALOG_MAP['gearbox_temp']:
+                temp_byte = raw[SMG_ANALOG_MAP['gearbox_temp']]
+                if temp_byte != 0xFF:
+                    data.gearbox_temp = temp_byte - 40
+                    logger.debug(f"SMG gearbox temp = {data.gearbox_temp}°C (raw: {temp_byte})")
                     
         # Also read block 0 for additional status
         response = connection.send(SMG_ECU_ADDR, DS2_CMD_BLOCK, bytes([0x00]))
@@ -249,13 +256,11 @@ def get_smg_data_ds2(connection: 'DS2Connection') -> SMGData:
                         data.gear = _parse_gear(gear_val)
                         break
             
-            # Temperature (raw - 40 formula)
-            if len(raw) > 3:
-                temp_byte = raw[3]
-                if temp_byte != 0xFF and temp_byte != 0x4E:  # Skip 'N' char
-                    data.gearbox_temp = temp_byte - 40
+            # NOTE: Block 0 contains ASCII status "-N-N", NOT temperature
+            # Temperature is read from Status command (0x0B) byte 3
                     
         # Read status command for pump and clutch info
+        # Note: Status command (0x0B) returns 0xB0 "busy" on SMG, limited data available
         response = connection.send(SMG_ECU_ADDR, DS2_CMD_STATUS)
         
         if response and response.valid and len(response.data) > 2:

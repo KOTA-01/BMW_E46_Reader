@@ -608,6 +608,25 @@ def live(ctx, interval, engine_only, smg_only):
 
 
 @cli.command()
+@click.option('--time', '-t', default=30, help='Monitoring duration in seconds')
+@click.pass_context
+def discover(ctx, time):
+    """Discover all ECU data and find changing variables
+    
+    Scans all ECUs, captures baseline data, then monitors for changes.
+    Use this to find live sensor values and map unknown data.
+    """
+    from .discovery import run_full_discovery
+    
+    port = ctx.obj['PORT']
+    click.echo(f"Starting full ECU discovery on {port}...")
+    click.echo(f"Will monitor for changes for {time} seconds")
+    click.echo("Shift gears, rev engine, etc. during monitoring!\n")
+    
+    run_full_discovery(port, monitor_time=time)
+
+
+@cli.command()
 @click.pass_context
 def gui(ctx):
     """Launch graphical dashboard"""

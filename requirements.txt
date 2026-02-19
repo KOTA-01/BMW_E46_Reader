@@ -1,0 +1,29 @@
+# BMW E46 Reader Dependencies
+
+# Serial communication
+pyserial>=3.5
+
+# OBD-II protocol library
+obd>=0.7.1
+
+# Data handling
+pandas>=2.0.0
+
+# CLI interface
+click>=8.1.0
+
+# Progress bars for CLI
+tqdm>=4.65.0
+
+# Configuration management
+pyyaml>=6.0
+
+# Logging
+loguru>=0.7.0
+
+# Development dependencies (optional)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0

@@ -2,19 +2,39 @@
 BMW E46 M3 SMG II Module
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Read data from the Sequential Manual Gearbox II transmission.
+Read data from the Sequential Manual Gearbox II transmission using DS2 protocol.
+
+DS2 Protocol:
+    ECU Address: 0x32
+    Baud Rate: 9600
+    Parity: Even
+    
+Commands:
+    0x00 - ECU identification
+    0x04 + block - Block read  
+    0x05 - Status
+    0x0A - Info
+    0x0D - Analog data
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from typing import Optional, Dict, Any, TYPE_CHECKING, Union
 from datetime import datetime
 from enum import Enum
 from loguru import logger
 
-from .config import ECU_ADDRESSES, SMG_PARAMETERS
+from .config import ECU_ADDRESSES
 
 if TYPE_CHECKING:
-    from .connection import E46Connection
+    from .ds2 import DS2Connection
+
+
+# DS2 Services for SMG
+DS2_SERVICE_STATUS = 0x0B  # Read status data
+DS2_SERVICE_IDENT = 0x00   # ECU identification
+DS2_SERVICE_DTC_READ = 0x07  # Read fault codes
+DS2_SERVICE_DTC_CLEAR = 0x05  # Clear fault codes
+DS2_SERVICE_JOB = 0x12       # Execute job/routine
 
 
 class GearPosition(Enum):
@@ -153,153 +173,197 @@ def _parse_shift_mode(value: int) -> ShiftMode:
     return ShiftMode.S3  # Default
 
 
-def get_smg_data(connection: 'E46Connection') -> SMGData:
+# DS2 command constants for SMG
+DS2_CMD_IDENT = 0x00      # ECU identification
+DS2_CMD_BLOCK = 0x04      # Block read
+DS2_CMD_STATUS = 0x05     # Status data
+DS2_CMD_ANALOG = 0x0D     # Analog channel data
+DS2_CMD_INFO = 0x0A       # Info data
+
+# SMG ECU address
+SMG_ECU_ADDR = 0x32
+
+# SMG data byte offsets (from command 0x0D response)
+# Based on testing and EdiabasLib documentation
+SMG_ANALOG_MAP = {
+    'status': 0,           # Status byte
+    'gear': 1,             # Current gear
+    'gear_requested': 2,   # Requested gear
+    'shift_mode': 3,       # Shift program (S1-S6, A)
+    'clutch_pos': 4,       # Clutch position
+    'hydraulic_high': 5,   # Hydraulic pressure high byte
+    'hydraulic_low': 6,    # Hydraulic pressure low byte
+    'gearbox_temp': 7,     # Gearbox temperature
+    'pump_status': 8,      # Pump running status
+    'shift_time_high': 9,  # Last shift time high
+    'shift_time_low': 10,  # Last shift time low
+}
+
+
+def get_smg_data_ds2(connection: 'DS2Connection') -> SMGData:
     """
-    Read all available SMG II parameters.
+    Read all available SMG II parameters using DS2 protocol.
     
     Args:
-        connection: Active E46Connection
+        connection: Active DS2Connection
         
     Returns:
         SMGData object with current values
     """
     data = SMGData()
-    ecu_addr = ECU_ADDRESSES.get('EGS', 0x32)
     
-    # Start diagnostic session with SMG ECU
-    connection.send_command(0x10, bytes([0x89]), ecu_addr)
-    
-    # Read gear position
-    logger.debug("Reading SMG gear position...")
-    response = connection.send_command(
-        0x21, 
-        bytes([SMG_PARAMETERS['GEAR_POSITION'].address]), 
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.gear = _parse_gear(response[1])
-        logger.debug(f"Gear: {data.gear}")
-    
-    # Read requested gear
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['GEAR_REQUESTED'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.gear_requested = _parse_gear(response[1])
-    
-    # Read shift mode
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['SHIFT_MODE'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.shift_mode = _parse_shift_mode(response[1])
-        logger.debug(f"Shift mode: {data.shift_mode}")
-    
-    # Read clutch position
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['CLUTCH_POSITION'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.clutch_position = response[1] * 100.0 / 255.0
-        logger.debug(f"Clutch position: {data.clutch_position:.1f}%")
-    
-    # Read clutch wear
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['CLUTCH_WEAR'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.clutch_wear = response[1] * 100.0 / 255.0
-        logger.debug(f"Clutch wear: {data.clutch_wear:.1f}%")
-    
-    # Read hydraulic pressure
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['HYDRAULIC_PRESSURE'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 2:
-        data.hydraulic_pressure = (response[1] * 256 + response[2]) / 10.0
-        logger.debug(f"Hydraulic pressure: {data.hydraulic_pressure:.1f} bar")
-    
-    # Read pump status
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['PUMP_STATUS'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.pump_running = bool(response[1] & 0x01)
-    
-    # Read gearbox temperature
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['GEARBOX_TEMP'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 1:
-        data.gearbox_temp = response[1] - 40  # Standard temp offset
-        logger.debug(f"Gearbox temp: {data.gearbox_temp:.1f}°C")
-    
-    # Read last shift time
-    response = connection.send_command(
-        0x21,
-        bytes([SMG_PARAMETERS['SHIFT_TIME'].address]),
-        ecu_addr
-    )
-    if response and len(response) > 2:
-        data.last_shift_time = response[1] * 256 + response[2]
-        logger.debug(f"Last shift time: {data.last_shift_time:.0f} ms")
-    
-    # Check for driveability flag
-    # This is set when the SMG needs adaptation or has issues
-    response = connection.send_command(0x21, bytes([0x50]), ecu_addr)
-    if response and len(response) > 1:
-        data.driveability_flag = bool(response[1] & 0x01)
-        if data.driveability_flag:
-            logger.warning("SMG driveability flag is set")
-    
+    try:
+        # Try analog data first (command 0x0D)
+        response = connection.send(SMG_ECU_ADDR, DS2_CMD_ANALOG)
+        
+        if response and response.valid and len(response.data) > 5:
+            raw = response.data
+            logger.debug(f"SMG analog data: {raw.hex()}")
+            
+            # Parse gear position
+            if len(raw) > 1:
+                gear_byte = raw[1] if raw[0] == 0xA0 else raw[0]  # Skip status if present
+                data.gear = _parse_gear(gear_byte & 0x0F)
+                
+            # Parse shift mode (may be in different position)
+            for i in range(min(5, len(raw))):
+                if 0 <= raw[i] <= 6:  # Valid shift mode range
+                    data.shift_mode = _parse_shift_mode(raw[i])
+                    break
+                    
+        # Also read block 0 for additional status
+        response = connection.send(SMG_ECU_ADDR, DS2_CMD_BLOCK, bytes([0x00]))
+        
+        if response and response.valid and len(response.data) > 3:
+            raw = response.data
+            logger.debug(f"SMG block 0 data: {raw.hex()}")
+            
+            # Status byte often at position 0
+            status_byte = raw[0]
+            
+            # Gear is often in lower nibble of a byte
+            for i, b in enumerate(raw[:5]):
+                if (b & 0x0F) <= 7:  # Valid gear value
+                    gear_val = b & 0x0F
+                    if gear_val > 0 or i > 0:  # Skip first byte if 0
+                        data.gear = _parse_gear(gear_val)
+                        break
+            
+            # Temperature (raw - 40 formula)
+            if len(raw) > 3:
+                temp_byte = raw[3]
+                if temp_byte != 0xFF and temp_byte != 0x4E:  # Skip 'N' char
+                    data.gearbox_temp = temp_byte - 40
+                    
+        # Read status command for pump and clutch info
+        response = connection.send(SMG_ECU_ADDR, DS2_CMD_STATUS)
+        
+        if response and response.valid and len(response.data) > 2:
+            raw = response.data
+            logger.debug(f"SMG status data: {raw.hex()}")
+            
+            # Try to find pump status bit
+            if len(raw) > 0:
+                data.pump_running = bool(raw[0] & 0x10)  # Typical bit position
+                
+            # Clutch position if available
+            if len(raw) > 2:
+                clutch = raw[2]
+                if clutch != 0xFF:
+                    data.clutch_position = clutch * 100.0 / 255.0
+                    
+    except Exception as e:
+        logger.error(f"Error reading SMG data: {e}")
+        
     return data
 
 
-def get_clutch_adaptation(connection: 'E46Connection') -> Dict[str, float]:
+def get_smg_identification(connection: 'DS2Connection') -> Dict[str, str]:
     """
-    Read SMG clutch adaptation values.
+    Get SMG ECU identification info.
+    
+    Returns:
+        Dict with part_number, sw_version, etc.
+    """
+    result = {
+        'part_number': '',
+        'sw_version': '',
+        'raw_data': ''
+    }
+    
+    try:
+        response = connection.send(SMG_ECU_ADDR, DS2_CMD_IDENT)
+        if response and response.valid:
+            data = response.data
+            result['raw_data'] = data.hex()
+            
+            # Try to extract ASCII part number
+            if len(data) >= 7:
+                # SMG part numbers are typically 7 digits
+                for i in range(len(data) - 6):
+                    try:
+                        part_str = ''.join(chr(b) for b in data[i:i+7] if 48 <= b <= 57)
+                        if len(part_str) >= 7:
+                            result['part_number'] = part_str[:7]
+                            break
+                    except:
+                        pass
+                        
+    except Exception as e:
+        logger.error(f"Error reading SMG identification: {e}")
+        
+    return result
+
+
+# Legacy function wrapper for backward compatibility  
+def get_smg_data(connection: 'DS2Connection') -> SMGData:
+    """
+    Read all available SMG II parameters.
+    
+    Args:
+        connection: Active DS2Connection
+        
+    Returns:
+        SMGData object with current values
+    """
+    return get_smg_data_ds2(connection)
+
+
+def get_clutch_adaptation_ds2(connection: 'DS2Connection') -> Dict[str, float]:
+    """
+    Read SMG clutch adaptation values using DS2 protocol.
     
     These values show how much the SMG has learned/adapted the clutch.
     
     Returns:
         Dictionary of adaptation values
     """
-    ecu_addr = ECU_ADDRESSES.get('EGS', 0x32)
     adaptations = {}
     
-    # Clutch kiss point
-    response = connection.send_command(0x21, bytes([0x60]), ecu_addr)
-    if response and len(response) > 1:
-        adaptations['kiss_point'] = response[1] * 100.0 / 255.0
-    
-    # Clutch slip adaptation
-    response = connection.send_command(0x21, bytes([0x61]), ecu_addr)
-    if response and len(response) > 1:
-        adaptations['slip_adaptation'] = response[1] - 128  # Signed value
-    
-    # Shift time adaptation
-    response = connection.send_command(0x21, bytes([0x62]), ecu_addr)
-    if response and len(response) > 1:
-        adaptations['shift_time_adapt'] = response[1] - 128
+    try:
+        # Read adaptation data via block read
+        response = connection.send(SMG_ECU_ADDR, DS2_CMD_BLOCK, bytes([0x60]))
+        if response and response.valid and len(response.data) > 2:
+            raw = response.data
+            # Adaptation values typically in sequential bytes
+            if len(raw) > 0 and raw[0] != 0xFF:
+                adaptations['kiss_point'] = raw[0] * 100.0 / 255.0
+            if len(raw) > 1 and raw[1] != 0xFF:
+                adaptations['slip_adaptation'] = raw[1] - 128  # Signed value
+            if len(raw) > 2 and raw[2] != 0xFF:
+                adaptations['shift_time_adapt'] = raw[2] - 128
+                
+    except Exception as e:
+        logger.error(f"Error reading clutch adaptation: {e}")
     
     return adaptations
 
 
-def reset_smg_adaptations(connection: 'E46Connection') -> bool:
+# Alias for backward compatibility
+get_clutch_adaptation = get_clutch_adaptation_ds2
+
+
+def reset_smg_adaptations(connection: 'DS2Connection') -> bool:
     """
     Reset SMG clutch adaptations.
     
@@ -310,66 +374,73 @@ def reset_smg_adaptations(connection: 'E46Connection') -> bool:
         True if successful
     """
     logger.warning("Resetting SMG adaptations...")
-    ecu_addr = ECU_ADDRESSES.get('EGS', 0x32)
     
-    # Enter extended diagnostic session
-    connection.send_command(0x10, bytes([0x86]), ecu_addr)
-    
-    # BMW routine to reset adaptations
-    response = connection.send_command(0x31, bytes([0x01, 0xF0]), ecu_addr)
-    
-    if response and len(response) >= 1:
-        if response[0] == 0x71:  # Positive response
+    try:
+        # DS2 reset adaptation command (varies by ECU)
+        # This uses a job/routine command
+        response = connection.send(SMG_ECU_ADDR, 0x12, bytes([0x01, 0xF0]))
+        
+        if response and response.valid:
             logger.success("SMG adaptations reset")
             return True
+            
+    except Exception as e:
+        logger.error(f"Failed to reset SMG adaptations: {e}")
     
-    logger.error("Failed to reset SMG adaptations")
     return False
 
 
-def get_smg_fault_history(connection: 'E46Connection') -> list:
+def get_smg_fault_history_ds2(connection: 'DS2Connection') -> list:
     """
-    Get SMG-specific fault history.
+    Get SMG-specific fault history using DS2 protocol.
     
     Returns more detailed SMG fault information than standard DTC reading.
     """
     from .dtc import FaultCode, DTCStatus, E46_M3_FAULT_CODES
     
     faults = []
-    ecu_addr = ECU_ADDRESSES.get('EGS', 0x32)
     
-    # Read SMG fault memory
-    response = connection.send_command(0x18, bytes([0xFF, 0xFF]), ecu_addr)
-    
-    if response and len(response) > 2:
-        i = 1
-        while i + 2 < len(response):
-            byte1 = response[i]
-            byte2 = response[i + 1]
-            status = response[i + 2]
-            
-            if byte1 != 0 or byte2 != 0:
-                # Construct code
-                code = f"P{byte1:02X}{byte2:02X}"
+    try:
+        # DS2 read faults command
+        response = connection.send(SMG_ECU_ADDR, 0x07)  # Read faults
+        
+        if response and response.valid and len(response.data) > 2:
+            raw = response.data
+            i = 0
+            while i + 2 < len(raw):
+                byte1 = raw[i]
+                byte2 = raw[i + 1]
+                status = raw[i + 2] if i + 2 < len(raw) else 0
                 
-                # Try to find description
-                desc = E46_M3_FAULT_CODES.get(code, "SMG fault")
+                if byte1 != 0 or byte2 != 0:
+                    # Construct code
+                    code = f"P{byte1:02X}{byte2:02X}"
+                    
+                    # Try to find description
+                    desc = E46_M3_FAULT_CODES.get(code, "SMG fault")
+                    
+                    dtc_status = DTCStatus.CONFIRMED if status & 0x80 else DTCStatus.PENDING
+                    
+                    faults.append(FaultCode(
+                        code=code,
+                        description=desc,
+                        status=dtc_status,
+                        ecu='SMG'
+                    ))
                 
-                dtc_status = DTCStatus.CONFIRMED if status & 0x80 else DTCStatus.PENDING
+                i += 3
                 
-                faults.append(FaultCode(
-                    code=code,
-                    description=desc,
-                    status=dtc_status,
-                    ecu='SMG'
-                ))
-            
-            i += 3
+    except Exception as e:
+        logger.error(f"Error reading SMG faults: {e}")
     
     return faults
 
 
-def smg_pump_test(connection: 'E46Connection') -> bool:
+# Alias for backward compatibility
+get_smg_fault_history = get_smg_fault_history_ds2
+
+
+def smg_pump_test(connection: 'DS2Connection') -> bool:
     """
     Run SMG hydraulic pump self-test.
     
@@ -379,18 +450,16 @@ def smg_pump_test(connection: 'E46Connection') -> bool:
         True if pump test passed
     """
     logger.info("Running SMG pump test...")
-    ecu_addr = ECU_ADDRESSES.get('EGS', 0x32)
     
-    # Enter extended diagnostic session
-    connection.send_command(0x10, bytes([0x86]), ecu_addr)
-    
-    # Actuator test for pump
-    response = connection.send_command(0x30, bytes([0x01, 0x01]), ecu_addr)
-    
-    if response and len(response) >= 2:
-        if response[0] == 0x70:
+    try:
+        # DS2 actuator test command
+        response = connection.send(SMG_ECU_ADDR, 0x30, bytes([0x01, 0x01]))
+        
+        if response and response.valid:
             logger.success("SMG pump test passed")
             return True
+            
+    except Exception as e:
+        logger.error(f"SMG pump test failed: {e}")
     
-    logger.error("SMG pump test failed")
     return False

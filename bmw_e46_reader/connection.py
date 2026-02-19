@@ -500,6 +500,258 @@ class E46Connection:
         return results
 
 
+class DS2Connection:
+    """
+    BMW DS2 Protocol Communication Handler.
+    
+    Based on research from:
+    - pBmwScanner (https://github.com/gigijoe/pBmwScanner)
+    - Diolum's gateway analysis (http://www.diolum.fr/analyse-gateway-e46)
+    - EdiabasLib (https://github.com/uholeschak/ediabaslib)
+    
+    DS2 Protocol Format:
+    [ADDRESS][LENGTH][DATA...][XOR_CHECKSUM]
+    
+    Settings: 9600 baud, 8E1 (8 data bits, EVEN parity, 1 stop bit)
+    """
+    
+    # Common ECU addresses
+    DME = 0x12      # Digital Motor Electronics
+    EGS = 0x32      # SMG/Transmission
+    DSC = 0x56      # Dynamic Stability Control
+    IHKA = 0x5B     # Climate Control
+    IKE = 0x80      # Instrument Cluster
+    AIRBAG = 0xA4   # Multi Restraint System
+    LCM = 0xD0      # Light Control Module
+    RLS = 0xE8      # Rain/Light Sensor
+    
+    def __init__(self, port: str, timeout: float = 0.5):
+        self.port = port
+        self.timeout = timeout
+        self._serial: Optional[serial.Serial] = None
+    
+    def __enter__(self):
+        self.connect()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+        return False
+    
+    def connect(self) -> bool:
+        """Open serial connection with DS2 settings"""
+        try:
+            self._serial = serial.Serial(
+                port=self.port,
+                baudrate=9600,              # DS2 uses 9600 baud
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_EVEN,  # EVEN parity is critical!
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.timeout,
+                write_timeout=self.timeout,
+            )
+            
+            # INPA cable in K-line mode
+            self._serial.rts = False
+            self._serial.dtr = True
+            
+            time.sleep(0.1)
+            self._serial.reset_input_buffer()
+            self._serial.reset_output_buffer()
+            
+            logger.info(f"DS2 connection opened on {self.port}")
+            return True
+            
+        except serial.SerialException as e:
+            logger.error(f"DS2 connection failed: {e}")
+            return False
+    
+    def disconnect(self):
+        """Close serial connection"""
+        if self._serial and self._serial.is_open:
+            self._serial.close()
+            logger.info("DS2 connection closed")
+    
+    @staticmethod
+    def _checksum(data: bytes) -> int:
+        """Calculate XOR checksum"""
+        result = 0
+        for b in data:
+            result ^= b
+        return result
+    
+    def _write(self, address: int, payload: bytes) -> None:
+        """
+        Send DS2 message.
+        
+        Format: [ADDRESS][LENGTH][PAYLOAD...][CHECKSUM]
+        Length = address + length byte + payload + checksum
+        """
+        length = 2 + len(payload) + 1  # addr + len + payload + checksum
+        msg = bytes([address, length]) + payload
+        checksum = self._checksum(msg)
+        full_msg = msg + bytes([checksum])
+        
+        logger.debug(f"DS2 TX: {full_msg.hex()}")
+        self._serial.write(full_msg)
+    
+    def _read(self) -> Optional[bytes]:
+        """
+        Read DS2 response.
+        
+        Returns full message including checksum, or None on timeout/error.
+        """
+        try:
+            # Read address byte
+            addr_byte = self._serial.read(1)
+            if not addr_byte:
+                return None
+            
+            # Read length byte
+            len_byte = self._serial.read(1)
+            if not len_byte:
+                return None
+            
+            address = addr_byte[0]
+            length = len_byte[0]
+            
+            # Read remaining bytes (length - 2 already read)
+            remaining = length - 2
+            if remaining > 0:
+                data = self._serial.read(remaining)
+                if len(data) < remaining:
+                    logger.warning(f"DS2 RX incomplete: expected {remaining}, got {len(data)}")
+                    return None
+            else:
+                data = b''
+            
+            full_msg = addr_byte + len_byte + data
+            
+            # Verify checksum
+            expected_cs = self._checksum(full_msg[:-1])
+            actual_cs = full_msg[-1]
+            
+            if expected_cs != actual_cs:
+                logger.warning(f"DS2 checksum mismatch: expected {expected_cs:02X}, got {actual_cs:02X}")
+            
+            logger.debug(f"DS2 RX: {full_msg.hex()}")
+            return full_msg
+            
+        except Exception as e:
+            logger.error(f"DS2 RX error: {e}")
+            return None
+    
+    def execute(self, address: int, command: bytes) -> Optional[bytes]:
+        """
+        Send DS2 command and receive response.
+        
+        Args:
+            address: Target ECU address
+            command: Command bytes to send
+            
+        Returns:
+            Response bytes (excluding echo), or None on error
+        """
+        self._serial.reset_input_buffer()
+        self._write(address, command)
+        
+        # Read echo (DS2 is half-duplex K-line)
+        echo = self._read()
+        
+        # Read actual response
+        response = self._read()
+        
+        if response is None:
+            logger.warning(f"No response from ECU 0x{address:02X}")
+            return None
+        
+        # Check response status
+        if len(response) > 2:
+            status = response[2]
+            if status == 0xA0:
+                pass  # Success
+            elif status == 0xA1:
+                logger.warning("ECU busy")
+            elif status == 0xA2:
+                logger.warning("Invalid parameter")
+            elif status == 0xFF:
+                logger.warning("Invalid command")
+            else:
+                logger.debug(f"Response status: 0x{status:02X}")
+        
+        return response
+    
+    def read_identity(self, address: int) -> Optional[Dict[str, Any]]:
+        """Read ECU identity (command 0x00)"""
+        response = self.execute(address, bytes([0x00]))
+        if response and len(response) > 3:
+            return {
+                'raw': response.hex(),
+                'address': response[0],
+                'length': response[1],
+                'status': response[2] if len(response) > 2 else None,
+                'data': response[3:] if len(response) > 3 else b'',
+            }
+        return None
+    
+    def read_status(self, address: int) -> Optional[Dict[str, Any]]:
+        """Read ECU status (command 0x0B)"""
+        response = self.execute(address, bytes([0x0B]))
+        if response and len(response) > 3:
+            return {
+                'raw': response.hex(),
+                'address': response[0],
+                'length': response[1],
+                'status': response[2] if len(response) > 2 else None,
+                'data': response[3:] if len(response) > 3 else b'',
+            }
+        return None
+    
+    def read_faults(self, address: int) -> Optional[Dict[str, Any]]:
+        """Read stored fault codes (command 0x07)"""
+        response = self.execute(address, bytes([0x07]))
+        if response and len(response) > 3:
+            return {
+                'raw': response.hex(),
+                'address': response[0],
+                'length': response[1],
+                'status': response[2] if len(response) > 2 else None,
+                'data': response[3:] if len(response) > 3 else b'',
+            }
+        return None
+    
+    def send(self, address: int, command: int, data: bytes = b'') -> Optional['DS2Response']:
+        """
+        Send DS2 command and return structured response.
+        
+        Compatible with ds2.py DS2Connection interface.
+        
+        Args:
+            address: Target ECU address
+            command: DS2 command byte
+            data: Additional data bytes
+            
+        Returns:
+            DS2Response-like object with .valid and .data attributes
+        """
+        cmd_bytes = bytes([command]) + data
+        response = self.execute(address, cmd_bytes)
+        
+        if response and len(response) > 2:
+            # Create a simple response object
+            class DS2Response:
+                def __init__(self, raw_response: bytes):
+                    self.address = raw_response[0]
+                    self.length = raw_response[1]
+                    self.status = raw_response[2] if len(raw_response) > 2 else 0
+                    self.data = raw_response[3:-1] if len(raw_response) > 4 else b''
+                    self.valid = self.status == 0xA0  # 0xA0 = success
+                    self.raw = raw_response
+            
+            return DS2Response(response)
+        return None
+
+
 def find_available_ports() -> List[str]:
     """Find available serial ports"""
     import sys

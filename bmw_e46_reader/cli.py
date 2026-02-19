@@ -160,18 +160,18 @@ def diagnose(ctx):
 @click.pass_context
 def engine(ctx, continuous, interval):
     """Read engine data"""
-    from .connection import E46Connection
-    from .engine import get_engine_data
+    from .connection import DS2Connection
+    from .engine import get_engine_data_ds2
     
     port = ctx.obj['PORT']
     
     try:
-        with E46Connection(port) as car:
+        with DS2Connection(port) as car:
             if continuous:
                 click.echo("Reading engine data (Ctrl+C to stop)...")
                 try:
                     while True:
-                        data = get_engine_data(car)
+                        data = get_engine_data_ds2(car)
                         click.clear()
                         click.echo(str(data))
                         import time
@@ -179,7 +179,7 @@ def engine(ctx, continuous, interval):
                 except KeyboardInterrupt:
                     click.echo("\nStopped")
             else:
-                data = get_engine_data(car)
+                data = get_engine_data_ds2(car)
                 click.echo(str(data))
                 
     except Exception as e:
@@ -220,18 +220,18 @@ def dtc(ctx, clear):
 @click.pass_context
 def smg(ctx, continuous, interval):
     """Read SMG transmission data"""
-    from .connection import E46Connection
-    from .smg import get_smg_data
+    from .connection import DS2Connection
+    from .smg import get_smg_data_ds2
     
     port = ctx.obj['PORT']
     
     try:
-        with E46Connection(port) as car:
+        with DS2Connection(port) as car:
             if continuous:
                 click.echo("Reading SMG data (Ctrl+C to stop)...")
                 try:
                     while True:
-                        data = get_smg_data(car)
+                        data = get_smg_data_ds2(car)
                         click.clear()
                         click.echo(str(data))
                         import time
@@ -239,7 +239,7 @@ def smg(ctx, continuous, interval):
                 except KeyboardInterrupt:
                     click.echo("\nStopped")
             else:
-                data = get_smg_data(car)
+                data = get_smg_data_ds2(car)
                 click.echo(str(data))
                 
     except Exception as e:
@@ -393,6 +393,217 @@ def dashboard(ctx):
                 
     except Exception as e:
         click.echo(click.style(f"Error: {e}", fg='red'))
+        sys.exit(1)
+
+
+@cli.command()
+@click.pass_context
+def ds2test(ctx):
+    """Test DS2 protocol communication (research-based)
+    
+    This tests the DS2 protocol with correct settings discovered from 
+    community projects (pBmwScanner, EdiabasLib, Diolum's gateway analysis):
+    
+    - 9600 baud (not 10400)
+    - EVEN parity (critical!)
+    - DS2 message format with XOR checksum
+    """
+    from .connection import DS2Connection
+    
+    port = ctx.obj['PORT']
+    click.echo(f"Testing DS2 protocol on {port}...")
+    click.echo("")
+    click.echo("Settings: 9600 baud, 8E1 (8 data bits, EVEN parity, 1 stop bit)")
+    click.echo("")
+    
+    try:
+        with DS2Connection(port) as ds2:
+            click.echo("=" * 50)
+            click.echo("DS2 Protocol Test")
+            click.echo("=" * 50)
+            
+            # Test ECUs
+            ecus = [
+                (0x12, 'DME (Engine)'),
+                (0x32, 'EGS/SMG'),
+                (0x80, 'IKE (Instrument)'),
+                (0x56, 'DSC (ABS)'),
+                (0xD0, 'LCM (Lights)'),
+                (0x5B, 'IHKA (Climate)'),
+            ]
+            
+            responding = []
+            
+            for addr, name in ecus:
+                click.echo(f"\n{name} (0x{addr:02X}):")
+                
+                # Try identity request (command 0x00)
+                result = ds2.read_identity(addr)
+                
+                if result and result.get('status') == 0xA0:
+                    click.echo(click.style(f"  ✓ Responding!", fg='green'))
+                    click.echo(f"    Raw: {result['raw']}")
+                    responding.append((addr, name))
+                elif result:
+                    click.echo(click.style(f"  ? Response: {result['raw']}", fg='yellow'))
+                    if result.get('status'):
+                        click.echo(f"    Status: 0x{result['status']:02X}")
+                else:
+                    click.echo(click.style("  ✗ No response", fg='red'))
+            
+            # Summary
+            click.echo("\n" + "=" * 50)
+            click.echo("SUMMARY")
+            click.echo("=" * 50)
+            
+            if responding:
+                click.echo(click.style(f"Responding ECUs: {len(responding)}", fg='green'))
+                for addr, name in responding:
+                    click.echo(f"  • {name} (0x{addr:02X})")
+            else:
+                click.echo(click.style("No ECUs responded", fg='yellow'))
+                click.echo("\nPossible issues:")
+                click.echo("  • Cable not connected to car")
+                click.echo("  • Ignition not on")
+                click.echo("  • Gateway blocking messages (OBD-II port)")
+                click.echo("\nTry:")
+                click.echo("  • Deep OBD app (Android) - handles gateway protocol")
+                click.echo("  • 20-pin round connector in engine bay (direct access)")
+                click.echo("  • INPA/EDIABAS on Windows")
+            
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg='red'))
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command()
+@click.option('--interval', '-i', default=1.0, help='Update interval in seconds')
+@click.option('--engine-only', '-e', is_flag=True, help='Only read engine data')
+@click.option('--smg-only', '-s', is_flag=True, help='Only read SMG data')
+@click.pass_context
+def live(ctx, interval, engine_only, smg_only):
+    """Live data display using DS2 protocol
+    
+    Shows real-time engine and SMG data with continuous updates.
+    Press Ctrl+C to stop.
+    """
+    from .connection import DS2Connection
+    from .engine import get_engine_data_ds2, get_engine_identification
+    from .smg import get_smg_data_ds2, get_smg_identification
+    import time
+    import os
+    
+    port = ctx.obj['PORT']
+    click.echo(f"Connecting to {port} using DS2 protocol...")
+    click.echo("Press Ctrl+C to stop")
+    click.echo("")
+    
+    try:
+        with DS2Connection(port) as ds2:
+            # Initial identification
+            click.echo("=" * 60)
+            click.echo("ECU IDENTIFICATION")
+            click.echo("=" * 60)
+            
+            if not smg_only:
+                dme_id = get_engine_identification(ds2)
+                if dme_id['raw_data']:
+                    click.echo(f"DME: {dme_id.get('part_number', 'Unknown')}")
+                    click.echo(f"     Raw: {dme_id['raw_data']}")
+                else:
+                    click.echo(click.style("DME: Not responding", fg='yellow'))
+                    
+            if not engine_only:
+                smg_id = get_smg_identification(ds2)
+                if smg_id['raw_data']:
+                    click.echo(f"SMG: {smg_id.get('part_number', 'Unknown')}")
+                    click.echo(f"     Raw: {smg_id['raw_data']}")
+                else:
+                    click.echo(click.style("SMG: Not responding", fg='yellow'))
+            
+            click.echo("")
+            
+            # Continuous data reading
+            while True:
+                # Clear screen (simple approach)
+                click.echo("\033[H\033[J", nl=False)  # ANSI clear screen
+                
+                click.echo("=" * 60)
+                click.echo(f"BMW E46 M3 LIVE DATA - {time.strftime('%H:%M:%S')}")
+                click.echo("=" * 60)
+                
+                if not smg_only:
+                    click.echo("")
+                    click.echo("ENGINE DATA (DME)")
+                    click.echo("-" * 30)
+                    
+                    engine_data = get_engine_data_ds2(ds2)
+                    
+                    if engine_data.rpm is not None:
+                        click.echo(f"  RPM:              {engine_data.rpm:.0f}")
+                    if engine_data.coolant_temp is not None:
+                        click.echo(f"  Coolant Temp:     {engine_data.coolant_temp:.1f}°C")
+                    if engine_data.oil_temp is not None:
+                        click.echo(f"  Oil Temp:         {engine_data.oil_temp:.1f}°C")
+                    if engine_data.intake_temp is not None:
+                        click.echo(f"  Intake Temp:      {engine_data.intake_temp:.1f}°C")
+                    if engine_data.engine_load is not None:
+                        click.echo(f"  Engine Load:      {engine_data.engine_load:.1f}%")
+                    if engine_data.throttle_position is not None:
+                        click.echo(f"  Throttle:         {engine_data.throttle_position:.1f}%")
+                    if engine_data.speed is not None:
+                        click.echo(f"  Speed:            {engine_data.speed:.0f} km/h")
+                    if engine_data.battery_voltage is not None:
+                        click.echo(f"  Battery:          {engine_data.battery_voltage:.1f}V")
+                    if engine_data.vanos_intake is not None:
+                        click.echo(f"  VANOS Intake:     {engine_data.vanos_intake:.1f}°")
+                    if engine_data.vanos_exhaust is not None:
+                        click.echo(f"  VANOS Exhaust:    {engine_data.vanos_exhaust:.1f}°")
+                    if engine_data.timing_advance is not None:
+                        click.echo(f"  Timing Advance:   {engine_data.timing_advance:.1f}°")
+                    
+                    # Check if we got any data
+                    if all(getattr(engine_data, attr) is None for attr in 
+                           ['rpm', 'coolant_temp', 'oil_temp', 'engine_load', 'throttle_position']):
+                        click.echo(click.style("  No data (engine off?)", fg='yellow'))
+                
+                if not engine_only:
+                    click.echo("")
+                    click.echo("SMG DATA")
+                    click.echo("-" * 30)
+                    
+                    smg_data = get_smg_data_ds2(ds2)
+                    
+                    # Gear display
+                    from .smg import GearPosition
+                    gear_str = 'N' if smg_data.gear == GearPosition.NEUTRAL else \
+                               'R' if smg_data.gear == GearPosition.REVERSE else \
+                               str(smg_data.gear.value) if smg_data.gear != GearPosition.UNKNOWN else '?'
+                    click.echo(f"  Current Gear:     {gear_str}")
+                    click.echo(f"  Shift Mode:       {smg_data.shift_mode.name}")
+                    
+                    if smg_data.clutch_position is not None:
+                        click.echo(f"  Clutch Position:  {smg_data.clutch_position:.1f}%")
+                    if smg_data.hydraulic_pressure is not None:
+                        click.echo(f"  Hydraulic Press:  {smg_data.hydraulic_pressure:.1f} bar")
+                    click.echo(f"  Pump Running:     {'Yes' if smg_data.pump_running else 'No'}")
+                    if smg_data.gearbox_temp is not None:
+                        click.echo(f"  Gearbox Temp:     {smg_data.gearbox_temp:.1f}°C")
+                
+                click.echo("")
+                click.echo("-" * 60)
+                click.echo("Press Ctrl+C to stop")
+                
+                time.sleep(interval)
+                
+    except KeyboardInterrupt:
+        click.echo("\n\nStopped by user")
+    except Exception as e:
+        click.echo(click.style(f"\nError: {e}", fg='red'))
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

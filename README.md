@@ -6,12 +6,22 @@ A Python library for reading diagnostic data from a 2006 BMW E46 M3 using a K+DC
 
 **K-Line communication is partially working.** The cable successfully initializes with the car's gateway module (ISO 9141-2 init responds with sync byte and keywords), but the gateway doesn't forward commands to individual ECUs. This is a known limitation of BMW's gateway architecture.
 
-**For full functionality, consider:**
-- **Deep OBD** - Android app that works with INPA cables ([Play Store](https://play.google.com/store/apps/details?id=de.holeschak.bmw_deep_obd))
-- **INPA/EDIABAS** - Official BMW diagnostic software (Windows)
-- **BMW Standard Tools** - Community-patched version of BMW tools
+### Working Linux Solutions
 
-The diagnostic command can help identify what's working on your specific setup.
+Based on community research, these are confirmed working options on Linux:
+
+| Solution | Link | Notes |
+|----------|------|-------|
+| **Deep OBD (Android)** | [Play Store](https://play.google.com/store/apps/details?id=de.holeschak.bmw_deep_obd) | Works with INPA cables via USB-OTG, full EDIABAS support |
+| **EdiabasLib (.NET/Mono)** | [GitHub](https://github.com/uholeschak/ediabaslib) | .NET library that runs on Mono, supports DS2/KWP2000 |
+| **pBmwScanner (Python)** | [GitHub](https://github.com/gigijoe/pBmwScanner) | Python DS2/KWP2000 for E38/E39, uses **20-pin connector** |
+
+### Why This Project Has Issues
+
+The E46 has a **gateway module** (in the instrument cluster) that sits between the OBD-II port and the ECUs. This gateway:
+- Responds to ISO 9141-2 5-baud initialization ✓
+- Requires proper BMW DS2 message format to forward commands ✗
+- Uses proprietary EDIABAS protocol layer that we haven't fully implemented
 
 ## Features
 
@@ -217,35 +227,150 @@ This is common on BMW E46. The OBD-II port connects to a gateway module (ZKE) th
 
 ## Protocol Details
 
-### What We Know About E46 M3
+### BMW E46 Communication Architecture
 
-The E46 M3 OBD-II port connects to:
-- **K-Line (Pin 7)**: ISO 9141-2 / KWP2000
-- **D-CAN (Pin 6)**: Not used on most E46 models
+```
+                    ┌─────────────────────────────────────────┐
+                    │           E46 M3 Architecture           │
+                    └─────────────────────────────────────────┘
+                    
+  OBD-II Port (Pin 7 K-Line)                 20-Pin Connector
+         │                                         │
+         ▼                                         ▼
+  ┌─────────────┐                           Direct ECU Access
+  │   Gateway   │                           (no gateway)
+  │   (IKE)     │
+  │   0x33      │
+  └──────┬──────┘
+         │
+    ┌────┴────────────────────────────────┐
+    │         K-Bus/Diag-Bus              │
+    └────┬──────┬──────┬──────┬──────────┘
+         │      │      │      │
+         ▼      ▼      ▼      ▼
+      ┌─────┐┌─────┐┌─────┐┌─────┐
+      │ DME ││ SMG ││ DSC ││ LCM │
+      │0x12 ││0x32 ││0x56 ││0xD0 │
+      └─────┘└─────┘└─────┘└─────┘
+```
 
-**Protocol Findings:**
-- 5-baud init to address 0x33 returns sync byte (0x55) and keywords (0x08 0x08)
-- Gateway completes initialization but doesn't forward messages
-- BMW's EDIABAS layer handles gateway routing (not standard OBD-II)
+### DS2 Protocol (Correct Format)
+
+From [pBmwScanner](https://github.com/gigijoe/pBmwScanner) and [Diolum's gateway analysis](http://www.diolum.fr/analyse-gateway-e46):
+
+**Serial Settings:**
+- **Baud Rate:** 9600
+- **Data Bits:** 8
+- **Parity:** EVEN ⚠️
+- **Stop Bits:** 1
+
+**Message Format:**
+```
+[DEST][LEN][CMD/DATA...][XOR_CHECKSUM]
+
+DEST      = Target ECU address (1 byte)
+LEN       = Total message length including checksum (1 byte)
+CMD/DATA  = Command and data bytes (variable)
+CHECKSUM  = XOR of all preceding bytes (1 byte)
+```
+
+**Example - Read DME Identity:**
+```
+TX: 12 04 00 16
+    │  │  │  └─ Checksum (0x12 XOR 0x04 XOR 0x00 = 0x16)
+    │  │  └──── Command: 0x00 (Identity Request)
+    │  └─────── Length: 4 bytes total
+    └────────── Dest: 0x12 (DME)
+```
+
+### KWP2000-BMW Protocol
+
+For ECUs using KWP2000 (like ME7.2):
+
+**Message Format:**
+```
+[0xB8][DEST][SRC][LEN][SID][DATA...][CHECKSUM]
+
+0xB8      = Header byte (fixed)
+DEST      = Target ECU address
+SRC       = Source address (usually 0xF1 = diagnostic tool)
+LEN       = Payload length
+SID       = Service ID
+DATA      = Service-specific data
+CHECKSUM  = XOR of all bytes
+```
+
+### Gateway Routing (via OBD-II)
+
+When using OBD-II port, messages go through gateway (0x33):
+
+**DiagBus → KBus Translation:**
+```
+DiagBus:  [DEST][LEN][CMD][DATA...][XOR]
+     ↓    Gateway (IKE) translates
+KBus:     [SRC=0x3F][LEN][DEST][CMD][DATA...][XOR]
+```
+
+**Important:** The gateway only forwards messages if properly formatted for BMW's protocol layer.
 
 ### ECU Addresses
 
-| Module | Address | Protocol |
-|--------|---------|----------|
-| Gateway/ZKE | 0x33 | K-Line |
-| DME (Engine) | 0x12 | DS2/KWP2000 |
-| EGS/SMG | 0x32 | DS2/KWP2000 |
-| Instrument Cluster | 0x80 | DS2 |
-| ABS/DSC | 0x56 | DS2 |
+| Module | Address | Protocol | Via OBD-II |
+|--------|---------|----------|------------|
+| Gateway/IKE | 0x33 | ISO 9141-2 | Yes (direct) |
+| DME (Engine) | 0x12 | DS2/KWP2000 | Via gateway |
+| EGS/SMG | 0x32 | DS2 | Via gateway |
+| Instrument Cluster | 0x80 | DS2 | Via gateway |
+| ABS/DSC | 0x56 | DS2 | Via gateway |
+| LCM (Lights) | 0xD0 | DS2 | Via gateway |
+| RLS (Rain/Light) | 0xE8 | DS2 | Via gateway |
+| IHKA (Climate) | 0x5B | DS2 | Via gateway |
+
+### INPA Cable Hardware
+
+Standard "INPA compatible" K+DCAN cables contain:
+- FTDI FT232RL USB-Serial chip
+- ATF16V8B PLD (programmable logic)
+- ATmega microcontroller
+- K-Line transceiver
+
+**Important:** These are NOT simple FTDI pass-through! The onboard MCU handles:
+- K-Line TX/RX switching
+- Echo management
+- DTR/RTS line control
+
+**Line Control:**
+- **RTS LOW** = K-Line mode (9600 baud)
+- **RTS HIGH** = D-CAN mode (500kbps CAN)
+- **DTR** = May control L-Line or TX enable
+
+### Differences from Standard OBD-II
+
+| Feature | Standard OBD-II | BMW E46 |
+|---------|-----------------|---------|
+| Protocol | ISO 9141-2 / KWP2000 | DS2 / KWP2000-BMW |
+| Baud | 10400 | 9600 |
+| Parity | None | Even |
+| Gateway | None | Required on OBD-II |
+| Header | ISO format | BMW format (0xB8) |
+
+### Known Working Code
+
+**pBmwScanner** (Python, E38/E39):
+```python
+# From k_line.py - proven working settings
+self._device = serial.Serial("/dev/ttyUSB0", 9600, parity=serial.PARITY_EVEN, timeout=0.5)
+
+# From ds2.py - DS2 message format
+def _write(self, address, payload):
+    size = 2 + len(payload) + 1  # addr + size + payload + checksum
+    p = bytearray([address, size])
+    p.extend(payload)
+    p.append(self._checksum(p))  # XOR checksum
+    self._device.write(p)
+```
 
 ### For Developers
-
-INPA cables are raw FTDI serial adapters:
-- **RTS LOW** = K-Line mode
-- **RTS HIGH** = D-CAN mode
-- **DTR** = May control L-Line on some cables
-
-The cable echoes all transmitted data on receive (half-duplex K-line).
 
 ## Alternative Tools
 
@@ -255,6 +380,35 @@ If this tool doesn't work with your setup:
 2. **INPA/EDIABAS (Windows)** - Search for "BMW Standard Tools" 
 3. **BMW Scanner 1.4.0** - Windows, older but simpler
 4. **Carly for BMW** - Commercial app/ELM327
+
+## References & Resources
+
+### Working Projects (Confirmed on Linux)
+
+| Project | Language | Description |
+|---------|----------|-------------|
+| [EdiabasLib](https://github.com/uholeschak/ediabaslib) | C#/.NET | Full EDIABAS replacement, runs on Mono |
+| [pBmwScanner](https://github.com/gigijoe/pBmwScanner) | Python | DS2/KWP2000 for E38/E39, **20-pin connector** |
+| [pyBus](https://github.com/ezeakeal/pyBus) | Python | iBus interface for E46 (radio, cluster, etc.) |
+| [node-bmw-ref](https://github.com/kmalinich/node-bmw-ref) | C/JS | BMW bus reference and examples |
+
+### Protocol Documentation
+
+| Resource | Description |
+|----------|-------------|
+| [Diolum E46 Gateway Analysis](http://www.diolum.fr/analyse-gateway-e46) | Detailed E46 gateway reverse engineering (French) |
+| [BMW Gateway Emulator](https://github.com/Diolum/BMW_gateway_emulator) | Arduino gateway emulator code |
+| [DiagTrx Library](https://github.com/Diolum/arduino-diagtrx) | Arduino library for BMW DiagBus |
+
+### Key Insights from Research
+
+1. **Serial Settings Matter**: BMW uses 9600 baud with EVEN parity, not 10400/no parity like standard OBD-II
+
+2. **20-Pin vs OBD-II**: The 20-pin round connector in the engine bay provides direct ECU access without gateway routing. pBmwScanner uses this approach.
+
+3. **Gateway Translation**: The IKE (instrument cluster) acts as a gateway, translating between DiagBus and KBus formats
+
+4. **EdiabasLib is the Reference**: The most complete open-source implementation of BMW protocols
 
 ## License
 

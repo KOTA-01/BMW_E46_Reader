@@ -10,8 +10,15 @@ from typing import Dict, List, Optional
 
 
 # K-Line Protocol Settings
-K_LINE_BAUD_RATE = 10400  # Standard BMW K-Line baud rate
+K_LINE_BAUD_RATE = 10400  # Standard ISO 9141-2 K-Line baud rate (for init)
 K_LINE_INIT_BAUD = 5  # 5 baud init for ISO 9141-2
+
+# BMW DS2 Protocol Settings (discovered from pBmwScanner/EdiabasLib research)
+# E46 and other BMW models use DS2 at 9600 baud with EVEN parity
+DS2_BAUD_RATE = 9600      # BMW DS2 protocol baud rate
+DS2_PARITY = 'E'          # EVEN parity (critical!)
+DS2_DATA_BITS = 8
+DS2_STOP_BITS = 1
 
 # D-CAN Protocol Settings  
 DCAN_BAUD_RATE = 500000  # 500 kbps CAN

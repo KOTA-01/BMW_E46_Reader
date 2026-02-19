@@ -2,18 +2,27 @@
 BMW E46 Engine Data Module
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Read engine parameters from the MSS54 ECU.
+Read engine parameters from the MSS54/MSS54HP ECU using DS2 protocol.
+
+DS2 Protocol commands for DME (0x12):
+    0x00 - ECU Identification (part number, SW version)
+    0x04 + block - Read block data (0x00=temps, etc.)
+    0x0D - Read analog channel data (RPM, temps, load, etc.)
+    0x07 - Read fault codes
+
+MSS54 Analog Data Format (command 0x0D response):
+    Based on EdiabasLib/pBmwScanner documentation
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from typing import Optional, Dict, Any, TYPE_CHECKING, Union
 from datetime import datetime
 from loguru import logger
 
-from .config import STANDARD_PIDS, MSS54_PIDS
+from .config import ECU_ADDRESSES
 
 if TYPE_CHECKING:
-    from .connection import E46Connection
+    from .ds2 import DS2Connection
 
 
 @dataclass
@@ -151,129 +160,165 @@ def _parse_pid_value(response: bytes, formula: str) -> Optional[float]:
         return None
 
 
-def get_engine_data(connection: 'E46Connection') -> EngineData:
+# DS2 command constants for DME
+DS2_CMD_IDENT = 0x00      # ECU identification
+DS2_CMD_BLOCK = 0x04      # Block read (temperature data etc.)
+DS2_CMD_ANALOG = 0x0D     # Analog data (main live data)
+DS2_CMD_STATUS = 0x0B     # Status data
+DS2_CMD_FAULTS = 0x07     # Read fault codes
+
+# MSS54 analog data byte offsets (from command 0x0D response)
+# These are empirical values based on testing and EdiabasLib
+MSS54_ANALOG_MAP = {
+    'status': 0,           # Status byte
+    'rpm_high': 1,         # RPM high byte
+    'rpm_low': 2,          # RPM low byte  
+    'coolant_temp': 3,     # Coolant temperature (raw-40)
+    'intake_temp': 4,      # Intake air temperature (raw-40)
+    'load': 5,             # Engine load %
+    'throttle': 6,         # Throttle position %
+    'maf_high': 7,         # MAF high byte
+    'maf_low': 8,          # MAF low byte
+    'vanos_intake': 9,     # VANOS intake position
+    'vanos_exhaust': 10,   # VANOS exhaust position
+    'timing_advance': 11,  # Timing advance
+    'o2_volts_1': 12,      # O2 sensor 1 voltage
+    'o2_volts_2': 13,      # O2 sensor 2 voltage
+    'supply_voltage': 14,  # Supply voltage x10
+    'fuel_trim_1': 15,     # Short term fuel trim bank 1
+    'fuel_trim_2': 16,     # Short term fuel trim bank 2
+    'oil_temp': 17,        # Oil temperature (if available)
+    'speed': 18,           # Vehicle speed (km/h)
+}
+
+
+def get_engine_data_ds2(connection: 'DS2Connection') -> EngineData:
     """
-    Read all available engine parameters.
+    Read all available engine parameters using DS2 protocol.
     
     Args:
-        connection: Active E46Connection
+        connection: Active DS2Connection
         
     Returns:
         EngineData object with current values
     """
     data = EngineData()
     
-    # Query standard OBD-II PIDs
-    pid_map = [
-        ('rpm', 'RPM'),
-        ('speed', 'SPEED'),
-        ('engine_load', 'ENGINE_LOAD'),
-        ('throttle_position', 'THROTTLE_POS'),
-        ('coolant_temp', 'COOLANT_TEMP'),
-        ('oil_temp', 'OIL_TEMP'),
-        ('intake_temp', 'INTAKE_TEMP'),
-        ('maf', 'MAF'),
-        ('intake_pressure', 'INTAKE_PRESSURE'),
-        ('short_fuel_trim_1', 'SHORT_FUEL_TRIM_1'),
-        ('long_fuel_trim_1', 'LONG_FUEL_TRIM_1'),
-        ('short_fuel_trim_2', 'SHORT_FUEL_TRIM_2'),
-        ('long_fuel_trim_2', 'LONG_FUEL_TRIM_2'),
-        ('timing_advance', 'TIMING_ADVANCE'),
-        ('battery_voltage', 'BATTERY_VOLTAGE'),
-    ]
-    
-    for attr, pid_name in pid_map:
-        if pid_name in STANDARD_PIDS:
-            pid_info = STANDARD_PIDS[pid_name]
-            response = connection.query_pid(pid_info.pid)
+    try:
+        # PRIMARY: Read temperature block (command 0x04, block 0)
+        # This reliably gives us temperatures
+        response = connection.send(0x12, DS2_CMD_BLOCK, bytes([0x00]))
+        
+        if response and response.valid and len(response.data) > 4:
+            raw = response.data
+            logger.debug(f"DME block 0 data: {raw.hex()}")
             
-            if response and len(response) > 2:
-                # Skip service ID and PID echo in response
-                value = _parse_pid_value(response[2:], pid_info.formula)
-                if value is not None:
-                    setattr(data, attr, value)
-                    logger.debug(f"{pid_name}: {value}")
-    
-    # Query BMW-specific PIDs for VANOS, knock, etc.
-    bmw_pid_map = [
-        ('vanos_intake', 'VANOS_INTAKE'),
-        ('vanos_exhaust', 'VANOS_EXHAUST'),
-        ('knock_sensor_1', 'KNOCK_SENSOR_1'),
-        ('knock_sensor_2', 'KNOCK_SENSOR_2'),
-        ('lambda_sensor_1', 'LAMBDA_SENSOR_1'),
-        ('lambda_sensor_2', 'LAMBDA_SENSOR_2'),
-        ('fuel_injector_time', 'FUEL_INJECTOR_TIME'),
-    ]
-    
-    for attr, pid_name in bmw_pid_map:
-        if pid_name in MSS54_PIDS:
-            pid_info = MSS54_PIDS[pid_name]
-            # Use BMW-specific read request (service 0x21)
-            response = connection.send_command(0x21, bytes([pid_info.address]))
+            # Block 0 format: [block_echo] [coolant] [?] [intake] [?] ...
+            # Byte 1 = coolant temp (raw - 40)
+            if len(raw) > 1 and raw[1] != 0xFF:
+                data.coolant_temp = raw[1] - 40
+                
+            # Byte 3 = intake temp (raw - 40)  
+            if len(raw) > 3 and raw[3] != 0xFF:
+                data.intake_temp = raw[3] - 40
+        
+        # Read block 1 for additional data
+        response = connection.send(0x12, DS2_CMD_BLOCK, bytes([0x01]))
+        
+        if response and response.valid and len(response.data) > 10:
+            raw = response.data
+            logger.debug(f"DME block 1 data: {raw.hex()}")
             
-            if response and len(response) > 1:
-                value = _parse_pid_value(response[1:], pid_info.formula)
-                if value is not None:
-                    setattr(data, attr, value)
-                    logger.debug(f"{pid_name}: {value}")
-    
+            # Block 1 contains various engine parameters
+            # Format varies but typically has RPM, load, etc.
+            # Skip first byte (block echo)
+            
+            # Try to find RPM - often at bytes 1-2 as 16-bit value
+            if len(raw) > 2:
+                rpm_b1 = raw[1]
+                rpm_b2 = raw[2]
+                # RPM typically 0-8000 range, so 16-bit value would be reasonable
+                rpm_raw = (rpm_b1 << 8) | rpm_b2
+                # If engine is off, we might get 0 or small values
+                if rpm_raw < 10000 and rpm_raw > 0:
+                    data.rpm = rpm_raw
+                    
+            # Engine load might be at byte 3
+            if len(raw) > 3:
+                load = raw[3]
+                if load != 0xFF and load != 0x00:
+                    data.engine_load = load * 100.0 / 255.0
+                    
+            # Throttle might be at byte 4 or 5
+            if len(raw) > 5:
+                throttle = raw[5]
+                if throttle != 0xFF and throttle != 0x00:
+                    data.throttle_position = throttle * 100.0 / 255.0
+        
+        # SECONDARY: Try analog command 0x0D for runtime data
+        # This has more complete data when engine is running
+        response = connection.send(0x12, DS2_CMD_ANALOG)
+        
+        if response and response.valid and len(response.data) > 45:
+            raw = response.data
+            logger.debug(f"DME analog data ({len(raw)} bytes): {raw.hex()}")
+            
+            # The analog response has a header section with job info
+            # Actual data starts after the 0xFF padding section
+            # Looking for non-FF values after byte ~40
+            
+            # Find the start of actual data (first non-FF after padding)
+            data_start = 40  # Skip header and FF padding
+            
+            if len(raw) > data_start + 10:
+                # RPM might be at bytes 42-43 (showing 0x0000 when engine off)
+                if raw[data_start] != 0xFF and raw[data_start + 1] != 0xFF:
+                    rpm_raw = (raw[data_start] << 8) | raw[data_start + 1]
+                    if 0 < rpm_raw < 10000:
+                        data.rpm = rpm_raw
+                        
+                # Battery voltage often in later bytes
+                # Look for reasonable voltage value (100-160 = 10.0-16.0V)
+                for i in range(data_start, min(len(raw), data_start + 30)):
+                    v = raw[i]
+                    if 100 <= v <= 160:
+                        data.battery_voltage = v / 10.0
+                        break
+                        
+    except Exception as e:
+        logger.error(f"Error reading engine data: {e}")
+        
     return data
 
 
-def get_single_value(connection: 'E46Connection', parameter: str) -> Optional[float]:
+def get_engine_identification(connection: 'DS2Connection') -> Dict[str, str]:
     """
-    Read a single engine parameter.
-    
-    Args:
-        connection: Active E46Connection
-        parameter: Parameter name (e.g., 'RPM', 'COOLANT_TEMP')
-        
-    Returns:
-        Parameter value or None if not available
-    """
-    parameter = parameter.upper()
-    
-    if parameter in STANDARD_PIDS:
-        pid_info = STANDARD_PIDS[parameter]
-        response = connection.query_pid(pid_info.pid)
-        
-        if response and len(response) > 2:
-            return _parse_pid_value(response[2:], pid_info.formula)
-    
-    elif parameter in MSS54_PIDS:
-        pid_info = MSS54_PIDS[parameter]
-        response = connection.send_command(0x21, bytes([pid_info.address]))
-        
-        if response and len(response) > 1:
-            return _parse_pid_value(response[1:], pid_info.formula)
-    
-    return None
-
-
-def get_supported_pids(connection: 'E46Connection') -> list:
-    """
-    Query which PIDs are supported by the ECU.
+    Get DME identification info.
     
     Returns:
-        List of supported PID numbers
+        Dict with part_number, sw_version, hw_version
     """
-    supported = []
+    result = {
+        'part_number': '',
+        'sw_version': '',
+        'hw_version': '',
+        'raw_data': ''
+    }
     
-    # Query supported PIDs in groups of 32
-    for base_pid in [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0]:
-        response = connection.query_pid(base_pid)
-        
-        if response and len(response) >= 6:
-            # Parse 4 bytes of PID support bitmap
-            bitmap = response[2:6]
+    try:
+        response = connection.send(0x12, DS2_CMD_IDENT)
+        if response and response.valid:
+            data = response.data
+            result['raw_data'] = data.hex()
             
-            for i, byte in enumerate(bitmap):
-                for bit in range(8):
-                    if byte & (0x80 >> bit):
-                        pid_num = base_pid + (i * 8) + bit + 1
-                        supported.append(pid_num)
-        else:
-            # Stop if ECU doesn't respond
-            break
-    
-    return supported
+            # Try to extract ASCII part number
+            # Format varies by ECU, but often contains ASCII text
+            if len(data) >= 10:
+                # Try to find ASCII sequences
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+                result['part_number'] = ascii_str.strip('.')
+                
+    except Exception as e:
+        logger.error(f"Error reading DME identification: {e}")
+        
+    return result

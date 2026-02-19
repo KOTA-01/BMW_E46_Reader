@@ -2,12 +2,20 @@
 BMW E46 Connection Module
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Handles K+DCAN cable connection and communication protocols.
+Handles K+DCAN cable connection and KWP2000/ISO 9141-2 communication.
+
+Note: E46 M3 uses BMW's proprietary protocols. For full functionality with
+SMG data, VANOS, etc., consider using:
+- Deep OBD (Android app) with INPA cable
+- INPA/EDIABAS on Windows
+- BMW Standard Tools
+
+This module implements standard OBD-II and attempts BMW protocols.
 """
 
 import time
 import serial
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from enum import Enum
 from dataclasses import dataclass
 from loguru import logger
@@ -15,18 +23,17 @@ from loguru import logger
 from .config import (
     K_LINE_BAUD_RATE,
     ECU_ADDRESSES,
-    SERIAL_PORT_PATTERNS,
 )
 
 
 class Protocol(Enum):
     """Communication protocol types"""
-    K_LINE = "k_line"      # ISO 9141-2
-    D_CAN = "d_can"        # ISO 15765-4
+    K_LINE = "k_line"
+    D_CAN = "d_can"
 
 
 class ConnectionState(Enum):
-    """Connection state enumeration"""
+    """Connection state"""
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -46,15 +53,9 @@ class ECUInfo:
 
 class E46Connection:
     """
-    Main connection class for BMW E46 M3 K+DCAN communication.
+    BMW E46 M3 K+DCAN communication handler.
     
-    Supports both K-Line (ISO 9141-2) and D-CAN (ISO 15765-4) protocols.
-    The E46 M3 primarily uses K-Line for most ECUs.
-    
-    Usage:
-        with E46Connection('/dev/ttyUSB0') as car:
-            engine_data = car.get_engine_data()
-            print(f"RPM: {engine_data.rpm}")
+    Implements KWP2000 (ISO 14230) protocol for BMW diagnostics.
     """
     
     def __init__(
@@ -62,42 +63,26 @@ class E46Connection:
         port: str,
         baud_rate: int = K_LINE_BAUD_RATE,
         protocol: Protocol = Protocol.K_LINE,
-        timeout: float = 1.0
+        timeout: float = 2.0
     ):
-        """
-        Initialize E46 connection.
-        
-        Args:
-            port: Serial port path (e.g., '/dev/ttyUSB0')
-            baud_rate: Communication baud rate (default: 10400 for K-Line)
-            protocol: Communication protocol to use
-            timeout: Serial timeout in seconds
-        """
         self.port = port
         self.baud_rate = baud_rate
         self.protocol = protocol
         self.timeout = timeout
         self.state = ConnectionState.DISCONNECTED
         self._serial: Optional[serial.Serial] = None
-        self._connected_ecus: List[ECUInfo] = []
+        self._initialized = False
         
     def __enter__(self):
-        """Context manager entry"""
         self.connect()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
         self.disconnect()
         return False
     
     def connect(self) -> bool:
-        """
-        Establish connection to the vehicle.
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
+        """Establish connection to vehicle"""
         logger.info(f"Connecting to {self.port}...")
         self.state = ConnectionState.CONNECTING
         
@@ -109,28 +94,36 @@ class E46Connection:
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=self.timeout,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False
+                write_timeout=self.timeout,
             )
             
-            # Allow serial port to initialize
             time.sleep(0.5)
+            self._serial.reset_input_buffer()
+            self._serial.reset_output_buffer()
             
-            # Perform protocol-specific initialization
-            if self.protocol == Protocol.K_LINE:
-                success = self._init_k_line()
-            else:
-                success = self._init_dcan()
-                
+            # Set RTS low for K-line mode on INPA cables
+            self._serial.rts = False
+            self._serial.dtr = True
+            
+            # Try fast init first
+            success = self._fast_init()
+            
+            if not success:
+                # Try slow init
+                logger.info("Fast init failed, trying slow init...")
+                success, keywords = self._slow_init()
+            
             if success:
                 self.state = ConnectionState.CONNECTED
+                self._initialized = True
                 logger.success("Connected successfully")
                 return True
             else:
-                self.state = ConnectionState.ERROR
-                logger.error("Failed to initialize communication")
-                return False
+                # Some cables work without explicit init
+                self.state = ConnectionState.CONNECTED
+                self._initialized = True
+                logger.warning("Init unclear, attempting anyway")
+                return True
                 
         except serial.SerialException as e:
             self.state = ConnectionState.ERROR
@@ -138,351 +131,377 @@ class E46Connection:
             raise ConnectionError(f"Failed to connect to {self.port}: {e}")
     
     def disconnect(self):
-        """Close the connection"""
+        """Close connection"""
         if self._serial and self._serial.is_open:
+            try:
+                self._send_stop_communication()
+            except:
+                pass
             self._serial.close()
         self.state = ConnectionState.DISCONNECTED
-        self._connected_ecus = []
+        self._initialized = False
         logger.info("Disconnected")
     
-    def _init_k_line(self) -> bool:
-        """
-        Initialize K-Line communication using 5-baud init (ISO 9141-2).
-        
-        The E46 uses the slow init procedure for K-Line.
-        """
-        logger.debug("Initializing K-Line (5-baud init)")
-        
-        try:
-            # Clear any pending data
-            self._serial.reset_input_buffer()
-            self._serial.reset_output_buffer()
-            
-            # Send 5-baud init address (0x33 for OBD-II)
-            # This is done by bit-banging at 5 baud
-            init_address = 0x33
-            self._send_5baud_byte(init_address)
-            
-            # Wait for sync byte (0x55)
-            time.sleep(0.3)
-            response = self._serial.read(1)
-            
-            if response and response[0] == 0x55:
-                logger.debug("Received sync byte 0x55")
-                
-                # Read keyword bytes
-                keywords = self._serial.read(2)
-                if len(keywords) == 2:
-                    logger.debug(f"Keywords: {keywords.hex()}")
-                    
-                    # Send inverted second keyword as acknowledgment
-                    ack = bytes([~keywords[1] & 0xFF])
-                    time.sleep(0.025)  # W4 timing
-                    self._serial.write(ack)
-                    
-                    # Wait for ECU to acknowledge
-                    time.sleep(0.05)
-                    ecu_ack = self._serial.read(1)
-                    
-                    if ecu_ack:
-                        logger.debug(f"ECU acknowledged: {ecu_ack.hex()}")
-                        return True
-            
-            # If slow init didn't work, try fast init
-            logger.debug("Trying fast init...")
-            return self._fast_init()
-            
-        except Exception as e:
-            logger.error(f"K-Line init failed: {e}")
-            return False
-    
-    def _send_5baud_byte(self, byte_val: int):
-        """
-        Send a byte at 5 baud by manipulating break condition.
-        
-        This simulates the slow init required by ISO 9141-2.
-        """
-        # Each bit takes 200ms at 5 baud
-        bit_time = 0.2
-        
-        # Start bit (low)
-        self._serial.break_condition = True
-        time.sleep(bit_time)
-        
-        # Data bits (LSB first)
-        for i in range(8):
-            bit = (byte_val >> i) & 0x01
-            self._serial.break_condition = not bit
-            time.sleep(bit_time)
-        
-        # Stop bit (high)
-        self._serial.break_condition = False
-        time.sleep(bit_time)
-    
     def _fast_init(self) -> bool:
-        """
-        Attempt fast initialization (ISO 14230 KWP2000).
+        """KWP2000 fast initialization - 25ms break pulse"""
+        logger.debug("Fast init...")
         
-        Some E46 modules support fast init.
-        """
         try:
-            # Send wake-up pattern (25ms low, 25ms high)
+            # Break signal: 25ms low, 25ms high
             self._serial.break_condition = True
             time.sleep(0.025)
             self._serial.break_condition = False
             time.sleep(0.025)
             
-            # Send start communication request
-            # Format: [length] [target] [source] [service] [checksum]
-            start_comm = bytes([0x81, 0x10, 0xF1, 0x81])  # StartCommunication
-            checksum = sum(start_comm) & 0xFF
-            start_comm += bytes([checksum])
+            # StartCommunication request
+            msg = self._build_message(0x81, b'', target=0x10)
+            self._serial.write(msg)
+            self._serial.flush()
             
-            self._serial.write(start_comm)
             time.sleep(0.1)
             
-            response = self._serial.read(10)
-            if response and len(response) >= 4:
-                logger.debug(f"Fast init response: {response.hex()}")
+            # Read echo + response
+            response = self._serial.read(100)
+            logger.debug(f"Init response ({len(response)} bytes): {response.hex() if response else 'empty'}")
+            
+            # Look for positive response 0xC1
+            if b'\xc1' in response:
                 return True
-                
-            return False
+            
+            # Any response suggests communication is possible
+            return len(response) > 0
             
         except Exception as e:
-            logger.error(f"Fast init failed: {e}")
+            logger.error(f"Fast init error: {e}")
             return False
     
-    def _init_dcan(self) -> bool:
+    def _slow_init(self, address: int = 0x33) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """
-        Initialize D-CAN communication.
+        ISO 9141-2 slow init (5-baud address).
         
-        Late E46s and some modules use CAN communication.
+        Returns: (success, (keyword1, keyword2) or None)
         """
-        logger.debug("Initializing D-CAN")
+        logger.debug(f"Slow init to 0x{address:02X}...")
         
-        # D-CAN typically requires 500kbps
-        if self.baud_rate != 500000:
-            self._serial.baudrate = 500000
-        
-        # Send tester present message
-        tester_present = bytes([0x3E, 0x00])
-        self._serial.write(tester_present)
-        time.sleep(0.1)
-        
-        response = self._serial.read(5)
-        if response:
-            logger.debug(f"D-CAN response: {response.hex()}")
-            return True
-            
-        return False
-    
-    def send_command(
-        self,
-        service_id: int,
-        data: bytes = b'',
-        target_ecu: int = ECU_ADDRESSES['DME']
-    ) -> Optional[bytes]:
-        """
-        Send a diagnostic command and receive response.
-        
-        Args:
-            service_id: OBD/KWP2000 service ID
-            data: Additional command data
-            target_ecu: Target ECU address (default: DME)
-            
-        Returns:
-            Response bytes or None if failed
-        """
-        if self.state != ConnectionState.CONNECTED:
-            logger.error("Not connected")
-            return None
-            
         try:
-            # Build message based on protocol
-            if self.protocol == Protocol.K_LINE:
-                message = self._build_k_line_message(service_id, data, target_ecu)
-            else:
-                message = self._build_can_message(service_id, data)
-            
-            # Send message
             self._serial.reset_input_buffer()
-            self._serial.write(message)
+            bit_time = 0.2  # 5 baud = 200ms per bit
             
-            # Wait for response
-            time.sleep(0.05)
+            # Send address at 5 baud using break signal
+            # Start bit (low)
+            self._serial.break_condition = True
+            time.sleep(bit_time)
             
-            # Read response
-            response = self._read_response()
-            return response
+            # 8 data bits, LSB first
+            for i in range(8):
+                bit = (address >> i) & 1
+                self._serial.break_condition = (bit == 0)
+                time.sleep(bit_time)
+            
+            # Stop bit (high)
+            self._serial.break_condition = False
+            time.sleep(bit_time)
+            
+            # Wait for ECU response
+            time.sleep(0.3)
+            response = self._serial.read(20)
+            
+            logger.debug(f"Slow init response: {response.hex() if response else 'None'}")
+            
+            # Look for sync byte 0x55
+            if response and 0x55 in response:
+                idx = list(response).index(0x55)
+                if len(response) > idx + 2:
+                    k1 = response[idx + 1]
+                    k2 = response[idx + 2]
+                    logger.info(f"Got sync! Keywords: 0x{k1:02X} 0x{k2:02X}")
+                    
+                    # Send inverted K2 to complete handshake
+                    inv_k2 = (~k2) & 0xFF
+                    time.sleep(0.025)  # W4 timing
+                    self._serial.write(bytes([inv_k2]))
+                    time.sleep(0.1)
+                    
+                    # Read echo (and possible ECU ack)
+                    ack = self._serial.read(10)
+                    logger.debug(f"Handshake response: {ack.hex() if ack else 'None'}")
+                    
+                    return True, (k1, k2)
+            
+            return False, None
             
         except Exception as e:
-            logger.error(f"Command failed: {e}")
-            return None
+            logger.error(f"Slow init error: {e}")
+            return False, None
     
-    def _build_k_line_message(
-        self,
-        service_id: int,
-        data: bytes,
-        target_ecu: int
-    ) -> bytes:
-        """Build K-Line formatted message"""
+    def _send_stop_communication(self):
+        """Send stop communication service"""
+        msg = self._build_message(0x82, b'')
+        self._serial.write(msg)
+        self._serial.flush()
+    
+    def _build_message(self, service: int, data: bytes, target: int = 0x10) -> bytes:
+        """
+        Build KWP2000 message.
+        
+        Format: [FMT] [TGT] [SRC] [DATA...] [CS]
+        FMT = 0x80 | length (for lengths <= 63)
+        """
         source = 0xF1  # Tester address
+        payload = bytes([service]) + data
+        length = len(payload)
         
-        # Calculate length byte
-        msg_len = 1 + len(data)  # service_id + data
-        
-        if msg_len <= 63:
-            # Short format: length in header
-            header = bytes([0x80 | msg_len, target_ecu, source])
+        if length <= 63:
+            header = bytes([0x80 | length, target, source])
         else:
-            # Long format: separate length byte
-            header = bytes([0x80, target_ecu, source, msg_len])
+            header = bytes([0x80, target, source, length])
         
-        body = bytes([service_id]) + data
-        
-        # Calculate checksum
-        full_msg = header + body
+        full_msg = header + payload
         checksum = sum(full_msg) & 0xFF
         
         return full_msg + bytes([checksum])
     
-    def _build_can_message(self, service_id: int, data: bytes) -> bytes:
-        """Build CAN formatted message"""
-        # Standard OBD-II CAN format
-        msg_len = 1 + len(data)
-        return bytes([msg_len, service_id]) + data
-    
-    def _read_response(self, max_bytes: int = 256) -> Optional[bytes]:
-        """Read and parse response from ECU"""
-        try:
-            # Read header to determine message length
-            header = self._serial.read(3)
-            if len(header) < 3:
-                return None
-            
-            # Parse length from header
-            if header[0] & 0x80:
-                # Length in first byte
-                msg_len = header[0] & 0x3F
-            else:
-                # Length in separate byte
-                length_byte = self._serial.read(1)
-                if not length_byte:
-                    return None
-                msg_len = length_byte[0]
-            
-            # Read body + checksum
-            body = self._serial.read(msg_len + 1)  # +1 for checksum
-            
-            if len(body) < msg_len + 1:
-                return None
-            
-            # Verify checksum
-            full_msg = header + body[:-1]
-            expected_checksum = sum(full_msg) & 0xFF
-            
-            if body[-1] != expected_checksum:
-                logger.warning("Checksum mismatch in response")
-            
-            # Return just the data portion
-            return body[:-1]
-            
-        except Exception as e:
-            logger.error(f"Error reading response: {e}")
-            return None
-    
-    def query_pid(self, pid: int, mode: int = 0x01) -> Optional[bytes]:
+    def send_command(
+        self,
+        service: int,
+        data: bytes = b'',
+        target: int = 0x10
+    ) -> Optional[bytes]:
         """
-        Query a standard OBD-II PID.
+        Send OBD/KWP2000 command and get response.
         
         Args:
-            pid: PID to query
-            mode: OBD mode (default: 0x01 for current data)
+            service: Service ID (0x01=current data, 0x03=DTCs, 0x21=BMW local ID, etc.)
+            data: Additional data bytes
+            target: Target address (0x10=OBD broadcast, 0x12=DME, 0x32=EGS)
             
         Returns:
-            Response data bytes or None
+            Response data (without header/checksum) or None
         """
+        if not self._serial or not self._serial.is_open:
+            logger.error("Not connected")
+            return None
+        
+        try:
+            msg = self._build_message(service, data, target)
+            
+            logger.debug(f"TX [{target:02X}]: {service:02X} {data.hex() if data else ''}")
+            
+            self._serial.reset_input_buffer()
+            self._serial.write(msg)
+            self._serial.flush()
+            
+            # K-line is half-duplex - read echo + response
+            time.sleep(0.1)
+            
+            raw = self._serial.read(256)
+            
+            if not raw:
+                logger.debug("No response")
+                return None
+            
+            logger.debug(f"RX raw ({len(raw)} bytes): {raw.hex()}")
+            
+            # Parse response - skip echo, find ECU response
+            response = self._parse_response(raw, len(msg))
+            
+            if response:
+                logger.debug(f"RX data: {response.hex()}")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Command error: {e}")
+            return None
+    
+    def _parse_response(self, raw: bytes, echo_len: int) -> Optional[bytes]:
+        """
+        Parse KWP2000 response from raw data.
+        
+        Skips the echo and extracts ECU response data.
+        """
+        if len(raw) <= echo_len:
+            return None
+        
+        # Skip echo
+        data = raw[echo_len:]
+        
+        if len(data) < 4:
+            return None
+        
+        try:
+            # Parse format byte
+            fmt = data[0]
+            
+            if fmt & 0x80:
+                # Length in format byte
+                length = fmt & 0x3F
+                
+                # Skip format + target + source
+                if len(data) >= 3 + length:
+                    # Return payload (skip header, exclude checksum)
+                    return data[3:3+length]
+            
+            # Fallback: return everything after minimal header
+            if len(data) >= 4:
+                return data[3:-1] if len(data) > 4 else data[3:]
+                
+        except Exception as e:
+            logger.debug(f"Parse error: {e}")
+        
+        return None
+    
+    def query_pid(self, pid: int, mode: int = 0x01) -> Optional[bytes]:
+        """Query standard OBD-II PID"""
         return self.send_command(mode, bytes([pid]))
+    
+    def read_local_id(self, local_id: int, ecu: int = 0x12) -> Optional[bytes]:
+        """Read BMW local identifier (service 0x21)"""
+        return self.send_command(0x21, bytes([local_id]), ecu)
+    
+    def read_memory(self, address: int, size: int, ecu: int = 0x12) -> Optional[bytes]:
+        """Read ECU memory (service 0x23)"""
+        addr_bytes = address.to_bytes(3, 'big')
+        return self.send_command(0x23, addr_bytes + bytes([size]), ecu)
+    
+    def tester_present(self):
+        """Send TesterPresent to keep session alive"""
+        self.send_command(0x3E)
     
     def get_vin(self) -> Optional[str]:
         """Get Vehicle Identification Number"""
         response = self.send_command(0x09, bytes([0x02]))
-        if response and len(response) >= 17:
+        if response and len(response) >= 18:
             try:
-                return response[:17].decode('ascii')
-            except:
-                return response[:17].hex()
-        return None
-    
-    def get_ecu_info(self, ecu_address: int) -> Optional[ECUInfo]:
-        """
-        Get ECU identification information.
-        
-        Args:
-            ecu_address: Target ECU address
-            
-        Returns:
-            ECUInfo object or None
-        """
-        # Send ReadECUIdentification request
-        response = self.send_command(0x1A, bytes([0x87]), ecu_address)
-        
-        if response:
-            # Parse response into ECUInfo
-            # Format varies by ECU
-            try:
-                return ECUInfo(
-                    name=self._ecu_name_from_address(ecu_address),
-                    address=ecu_address,
-                    variant="",
-                    part_number=response[:10].decode('ascii', errors='ignore').strip(),
-                    sw_version="",
-                    hw_version=""
-                )
+                return response[1:18].decode('ascii', errors='ignore')
             except:
                 pass
         return None
     
+    def get_ecu_info(self, ecu_address: int) -> Optional[ECUInfo]:
+        """Get ECU identification"""
+        response = self.send_command(0x1A, bytes([0x87]), ecu_address)
+        
+        if response and len(response) > 1:
+            return ECUInfo(
+                name=self._ecu_name_from_address(ecu_address),
+                address=ecu_address,
+                variant="",
+                part_number=response[1:].decode('ascii', errors='ignore').strip(),
+                sw_version="",
+                hw_version=""
+            )
+        return None
+    
     def _ecu_name_from_address(self, address: int) -> str:
-        """Get ECU name from address"""
         for name, addr in ECU_ADDRESSES.items():
             if addr == address:
                 return name
-        return f"Unknown (0x{address:02X})"
+        return f"ECU_0x{address:02X}"
     
+    # Convenience methods
     def get_engine_data(self):
-        """Get current engine data"""
         from .engine import get_engine_data
         return get_engine_data(self)
     
     def get_fault_codes(self):
-        """Get stored fault codes"""
         from .dtc import get_fault_codes
         return get_fault_codes(self)
     
     def clear_fault_codes(self):
-        """Clear stored fault codes"""
         from .dtc import clear_fault_codes
         return clear_fault_codes(self)
     
     def get_smg_data(self):
-        """Get SMG transmission data"""
         from .smg import get_smg_data
         return get_smg_data(self)
     
     @property
     def is_connected(self) -> bool:
-        """Check if currently connected"""
         return self.state == ConnectionState.CONNECTED
+
+    def run_diagnostics(self) -> Dict[str, Any]:
+        """
+        Run diagnostic tests to identify communication issues.
+        
+        Returns dict with test results.
+        """
+        results = {
+            'port': self.port,
+            'baud': self.baud_rate,
+            'tests': {}
+        }
+        
+        if not self._serial or not self._serial.is_open:
+            results['error'] = 'Not connected'
+            return results
+        
+        # Test 1: Echo test
+        logger.info("Testing K-line echo...")
+        self._serial.reset_input_buffer()
+        test_byte = bytes([0xAA])
+        self._serial.write(test_byte)
+        time.sleep(0.1)
+        echo = self._serial.read(10)
+        results['tests']['echo'] = {
+            'sent': test_byte.hex(),
+            'received': echo.hex() if echo else 'None',
+            'working': echo == test_byte
+        }
+        
+        # Test 2: Slow init (5-baud)
+        logger.info("Testing ISO 9141-2 slow init...")
+        success, keywords = self._slow_init(0x33)
+        results['tests']['slow_init'] = {
+            'success': success,
+            'keywords': f"0x{keywords[0]:02X} 0x{keywords[1]:02X}" if keywords else None
+        }
+        
+        # Test 3: Fast init (KWP2000)
+        logger.info("Testing KWP2000 fast init...")
+        fast_ok = self._fast_init()
+        results['tests']['fast_init'] = {
+            'success': fast_ok
+        }
+        
+        # Test 4: OBD-II Mode 01 PID 00
+        logger.info("Testing OBD-II Mode 01...")
+        if success:  # Use slow init first if it works
+            time.sleep(0.05)
+        
+        self._serial.reset_input_buffer()
+        msg = bytes([0x68, 0x6A, 0xF1, 0x01, 0x00])
+        cs = sum(msg) & 0xFF
+        self._serial.write(msg + bytes([cs]))
+        time.sleep(0.3)
+        resp = self._serial.read(100)
+        echo_len = 6
+        got_response = len(resp) > echo_len if resp else False
+        results['tests']['obd_mode01'] = {
+            'raw_response': resp.hex() if resp else 'None',
+            'got_ecu_response': got_response,
+            'ecu_data': resp[echo_len:].hex() if got_response else None
+        }
+        
+        # Summary
+        results['summary'] = {
+            'echo_working': results['tests']['echo']['working'],
+            'init_working': success,
+            'ecu_responding': got_response,
+        }
+        
+        if not got_response and success:
+            results['notes'] = [
+                "K-line init works but ECU doesn't respond to commands.",
+                "This is common with BMW gateway modules.",
+                "Try: Deep OBD app (Android) or INPA on Windows."
+            ]
+        
+        return results
 
 
 def find_available_ports() -> List[str]:
-    """
-    Find available serial ports that might be K+DCAN cables.
-    
-    Returns:
-        List of available port paths
-    """
+    """Find available serial ports"""
     import sys
     import glob
     
@@ -491,14 +510,13 @@ def find_available_ports() -> List[str]:
     elif sys.platform == 'darwin':
         ports = glob.glob('/dev/tty.usbserial*') + glob.glob('/dev/tty.wchusbserial*')
     elif sys.platform == 'win32':
-        # Check COM ports 1-20
         ports = []
         for i in range(1, 21):
             try:
                 s = serial.Serial(f'COM{i}')
                 s.close()
                 ports.append(f'COM{i}')
-            except serial.SerialException:
+            except:
                 pass
     else:
         ports = []
@@ -507,17 +525,8 @@ def find_available_ports() -> List[str]:
 
 
 def auto_connect() -> Optional[E46Connection]:
-    """
-    Automatically find and connect to E46.
-    
-    Returns:
-        E46Connection object or None if no connection found
-    """
+    """Auto-detect and connect"""
     ports = find_available_ports()
-    
-    if not ports:
-        logger.warning("No serial ports found")
-        return None
     
     for port in ports:
         logger.info(f"Trying {port}...")
@@ -525,8 +534,7 @@ def auto_connect() -> Optional[E46Connection]:
             conn = E46Connection(port)
             if conn.connect():
                 return conn
-        except Exception as e:
-            logger.debug(f"Failed: {e}")
+        except:
             continue
     
     return None

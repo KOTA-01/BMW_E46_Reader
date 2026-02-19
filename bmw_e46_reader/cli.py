@@ -75,6 +75,86 @@ def connect(ctx):
 
 
 @cli.command()
+@click.pass_context
+def diagnose(ctx):
+    """Run diagnostic tests to identify communication issues"""
+    from .connection import E46Connection
+    import json
+    
+    port = ctx.obj['PORT']
+    click.echo(f"Running diagnostics on {port}...")
+    click.echo("")
+    
+    try:
+        conn = E46Connection(port)
+        conn._serial = __import__('serial').Serial(
+            port=port,
+            baudrate=conn.baud_rate,
+            timeout=conn.timeout
+        )
+        conn._serial.rts = False
+        conn._serial.dtr = True
+        
+        results = conn.run_diagnostics()
+        
+        # Display results nicely
+        click.echo("=" * 50)
+        click.echo("DIAGNOSTIC RESULTS")
+        click.echo("=" * 50)
+        
+        tests = results.get('tests', {})
+        
+        # Echo test
+        echo_test = tests.get('echo', {})
+        status = click.style("✓ PASS", fg='green') if echo_test.get('working') else click.style("✗ FAIL", fg='red')
+        click.echo(f"\n1. K-Line Echo Test: {status}")
+        click.echo(f"   Sent: {echo_test.get('sent')}, Received: {echo_test.get('received')}")
+        
+        # Slow init
+        slow_init = tests.get('slow_init', {})
+        status = click.style("✓ PASS", fg='green') if slow_init.get('success') else click.style("✗ FAIL", fg='red')
+        click.echo(f"\n2. ISO 9141-2 Slow Init: {status}")
+        if slow_init.get('keywords'):
+            click.echo(f"   Keywords: {slow_init.get('keywords')}")
+        
+        # Fast init
+        fast_init = tests.get('fast_init', {})
+        status = click.style("✓ PASS", fg='green') if fast_init.get('success') else click.style("✗ FAIL", fg='red')
+        click.echo(f"\n3. KWP2000 Fast Init: {status}")
+        
+        # OBD Mode 01
+        obd_test = tests.get('obd_mode01', {})
+        status = click.style("✓ PASS", fg='green') if obd_test.get('got_ecu_response') else click.style("✗ FAIL", fg='red')
+        click.echo(f"\n4. OBD-II Mode 01 Response: {status}")
+        click.echo(f"   Raw: {obd_test.get('raw_response')}")
+        if obd_test.get('ecu_data'):
+            click.echo(f"   ECU Data: {obd_test.get('ecu_data')}")
+        
+        # Summary
+        click.echo("\n" + "=" * 50)
+        click.echo("SUMMARY")
+        click.echo("=" * 50)
+        
+        summary = results.get('summary', {})
+        for key, value in summary.items():
+            status = click.style("Yes", fg='green') if value else click.style("No", fg='yellow')
+            click.echo(f"  {key}: {status}")
+        
+        # Notes
+        notes = results.get('notes', [])
+        if notes:
+            click.echo("\n" + click.style("NOTES:", fg='yellow'))
+            for note in notes:
+                click.echo(f"  • {note}")
+        
+        conn._serial.close()
+        
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg='red'))
+        sys.exit(1)
+
+
+@cli.command()
 @click.option('--continuous', '-c', is_flag=True, help='Continuously read data')
 @click.option('--interval', '-i', default=1.0, help='Read interval in seconds')
 @click.pass_context

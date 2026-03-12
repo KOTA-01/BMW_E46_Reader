@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <title>E46 M3 Telemetry</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+<div class="dashboard">
+
+    <!-- ===== TOP BAR ===== -->
+    <header class="top-bar">
+        <div class="top-bar__section">
+            <span class="top-bar__car-id">E46 M3 · MSS54</span>
+            <div class="top-bar__divider"></div>
+            <span class="top-bar__mode" id="trackMode">TRACK</span>
+            <div class="top-bar__divider"></div>
+            <span class="top-bar__lap-label">LAP</span>
+            <span class="top-bar__lap-timer" id="lapTimerTop">0:00.000</span>
+        </div>
+        <div class="top-bar__section">
+            <span class="top-bar__hz" id="updateHz">-- Hz</span>
+            <div class="top-bar__divider"></div>
+            <span class="top-bar__timestamp" id="timestamp">--:--:--</span>
+            <div class="top-bar__divider"></div>
+            <div class="connection-status">
+                <div class="connection-status__dot" id="connDot"></div>
+                <span id="connText">DISCONNECTED</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <div class="main-content">
+
+        <!-- Left: Telemetry Area -->
+        <div class="telemetry-area">
+
+            <!-- RPM Tachometer Strip -->
+            <div class="rpm-strip">
+                <div class="rpm-strip__header">
+                    <span class="rpm-strip__value" id="rpmValue">----</span>
+                    <span class="rpm-strip__label">RPM</span>
+                </div>
+                <div class="rpm-strip__bar-container">
+                    <div class="rpm-strip__shift-zone" id="rpmShiftZone" style="width: 12.5%"></div>
+                    <div class="rpm-strip__bar-fill bar--rpm" id="rpmBar" style="width: 0%"></div>
+                    <div class="rpm-strip__redline" id="rpmRedline" style="left: 87.5%"></div>
+                </div>
+                <div class="rpm-strip__ticks">
+                    <span class="rpm-strip__tick">0</span>
+                    <span class="rpm-strip__tick">1</span>
+                    <span class="rpm-strip__tick">2</span>
+                    <span class="rpm-strip__tick">3</span>
+                    <span class="rpm-strip__tick">4</span>
+                    <span class="rpm-strip__tick">5</span>
+                    <span class="rpm-strip__tick">6</span>
+                    <span class="rpm-strip__tick">7</span>
+                    <span class="rpm-strip__tick">8</span>
+                </div>
+            </div>
+
+            <!-- Critical Gauges Row -->
+            <div class="critical-gauges">
+
+                <!-- Oil Pressure -->
+                <div class="gauge-cell">
+                    <span class="gauge-cell__label">Oil Press</span>
+                    <div class="gauge-cell__value-row">
+                        <span class="gauge-cell__value" id="oilPressValue">--</span>
+                        <span class="gauge-cell__unit">bar</span>
+                    </div>
+                    <div class="gauge-cell__bar">
+                        <div class="gauge-cell__bar-fill bar--cyan" id="oilPressBar" style="width: 0%"></div>
+                    </div>
+                    <div class="gauge-cell__range">
+                        <span class="gauge-cell__range-val">0</span>
+                        <span class="gauge-cell__range-val">6</span>
+                    </div>
+                </div>
+
+                <!-- Oil Temperature -->
+                <div class="gauge-cell">
+                    <span class="gauge-cell__label">Oil Temp</span>
+                    <div class="gauge-cell__value-row">
+                        <span class="gauge-cell__value" id="oilTempValue">--</span>
+                        <span class="gauge-cell__unit">°C</span>
+                    </div>
+                    <div class="gauge-cell__bar">
+                        <div class="gauge-cell__bar-fill bar--normal" id="oilTempBar" style="width: 0%"></div>
+                    </div>
+                    <div class="gauge-cell__range">
+                        <span class="gauge-cell__range-val">50</span>
+                        <span class="gauge-cell__range-val">150</span>
+                    </div>
+                </div>
+
+                <!-- Coolant Temperature -->
+                <div class="gauge-cell">
+                    <span class="gauge-cell__label">Coolant</span>
+                    <div class="gauge-cell__value-row">
+                        <span class="gauge-cell__value" id="coolantValue">--</span>
+                        <span class="gauge-cell__unit">°C</span>
+                    </div>
+                    <div class="gauge-cell__bar">
+                        <div class="gauge-cell__bar-fill bar--normal" id="coolantBar" style="width: 0%"></div>
+                    </div>
+                    <div class="gauge-cell__range">
+                        <span class="gauge-cell__range-val">50</span>
+                        <span class="gauge-cell__range-val">130</span>
+                    </div>
+                </div>
+
+                <!-- AFR / Lambda -->
+                <div class="gauge-cell">
+                    <span class="gauge-cell__label">AFR λ</span>
+                    <div class="gauge-cell__value-row">
+                        <span class="gauge-cell__value" id="afrValue">--</span>
+                        <span class="gauge-cell__unit">λ</span>
+                    </div>
+                    <div class="gauge-cell__bar">
+                        <div class="gauge-cell__bar-fill bar--blue" id="afrBar" style="width: 50%"></div>
+                    </div>
+                    <div class="gauge-cell__range">
+                        <span class="gauge-cell__range-val">0.70</span>
+                        <span class="gauge-cell__range-val">1.30</span>
+                    </div>
+                </div>
+
+                <!-- Battery Voltage -->
+                <div class="gauge-cell">
+                    <span class="gauge-cell__label">Battery</span>
+                    <div class="gauge-cell__value-row">
+                        <span class="gauge-cell__value" id="battValue">--</span>
+                        <span class="gauge-cell__unit">V</span>
+                    </div>
+                    <div class="gauge-cell__bar">
+                        <div class="gauge-cell__bar-fill bar--cyan" id="battBar" style="width: 0%"></div>
+                    </div>
+                    <div class="gauge-cell__range">
+                        <span class="gauge-cell__range-val">10</span>
+                        <span class="gauge-cell__range-val">16</span>
+                    </div>
+                </div>
+
+                <!-- Engine Load -->
+                <div class="gauge-cell">
+                    <span class="gauge-cell__label">Load</span>
+                    <div class="gauge-cell__value-row">
+                        <span class="gauge-cell__value" id="loadValue">--</span>
+                        <span class="gauge-cell__unit">%</span>
+                    </div>
+                    <div class="gauge-cell__bar">
+                        <div class="gauge-cell__bar-fill bar--normal" id="loadBar" style="width: 0%"></div>
+                    </div>
+                    <div class="gauge-cell__range">
+                        <span class="gauge-cell__range-val">0</span>
+                        <span class="gauge-cell__range-val">100</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Secondary Telemetry Row -->
+            <div class="secondary-grid">
+                <div class="telemetry-cell">
+                    <span class="telemetry-cell__label">Intake Air</span>
+                    <div class="telemetry-cell__value-row">
+                        <span class="telemetry-cell__value" id="iatValue">--</span>
+                        <span class="telemetry-cell__unit">°C</span>
+                    </div>
+                    <div class="telemetry-cell__bar">
+                        <div class="telemetry-cell__bar-fill bar--cyan" id="iatBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="telemetry-cell">
+                    <span class="telemetry-cell__label">MAF</span>
+                    <div class="telemetry-cell__value-row">
+                        <span class="telemetry-cell__value" id="mafValue">--</span>
+                        <span class="telemetry-cell__unit">g/s</span>
+                    </div>
+                    <div class="telemetry-cell__bar">
+                        <div class="telemetry-cell__bar-fill bar--blue" id="mafBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="telemetry-cell">
+                    <span class="telemetry-cell__label">Throttle</span>
+                    <div class="telemetry-cell__value-row">
+                        <span class="telemetry-cell__value" id="tpsValue">--</span>
+                        <span class="telemetry-cell__unit">%</span>
+                    </div>
+                    <div class="telemetry-cell__bar">
+                        <div class="telemetry-cell__bar-fill bar--normal" id="tpsBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="telemetry-cell">
+                    <span class="telemetry-cell__label">Timing Adv</span>
+                    <div class="telemetry-cell__value-row">
+                        <span class="telemetry-cell__value" id="timingValue">--</span>
+                        <span class="telemetry-cell__unit">°BTDC</span>
+                    </div>
+                    <div class="telemetry-cell__bar">
+                        <div class="telemetry-cell__bar-fill bar--cyan" id="timingBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="telemetry-cell">
+                    <span class="telemetry-cell__label">Fuel Trim</span>
+                    <div class="telemetry-cell__value-row">
+                        <span class="telemetry-cell__value" id="fuelTrimValue">--</span>
+                        <span class="telemetry-cell__unit">%</span>
+                    </div>
+                    <div class="telemetry-cell__bar">
+                        <div class="telemetry-cell__bar-fill bar--blue" id="fuelTrimBar" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Vehicle Dynamics Row -->
+            <div class="dynamics-panel">
+                <!-- G-Force Meter -->
+                <div class="gforce-widget">
+                    <span class="gforce-widget__title">G-Force</span>
+                    <div class="gforce-display">
+                        <canvas class="gforce-display__canvas" id="gforceCanvas" width="216" height="216"></canvas>
+                    </div>
+                    <div class="gforce-display__values">
+                        <div class="gforce-display__axis">
+                            <div class="gforce-display__axis-label">LAT</div>
+                            <div class="gforce-display__axis-value" id="gforceLat">0.00</div>
+                        </div>
+                        <div class="gforce-display__axis">
+                            <div class="gforce-display__axis-label">LON</div>
+                            <div class="gforce-display__axis-value" id="gforceLon">0.00</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speed + Gear -->
+                <div class="dynamics-center">
+                    <div class="speed-display">
+                        <span class="speed-display__label">Speed</span>
+                        <span class="speed-display__value" id="speedValue">---</span>
+                        <span class="speed-display__unit">KM/H</span>
+                    </div>
+                    <div class="gear-display">
+                        <span class="gear-display__label">Gear</span>
+                        <span class="gear-display__value" id="gearValue">N</span>
+                        <span class="gear-display__mode" id="shiftMode">S3</span>
+                    </div>
+                </div>
+
+                <!-- Traction -->
+                <div class="traction-widget">
+                    <span class="traction-widget__title">Traction</span>
+                    <div class="traction-indicator">
+                        <div class="traction-indicator__row">
+                            <span class="traction-indicator__label">FL</span>
+                            <div class="traction-indicator__bar">
+                                <div class="traction-indicator__bar-fill bar--normal" id="tractionFL" style="width: 80%"></div>
+                            </div>
+                        </div>
+                        <div class="traction-indicator__row">
+                            <span class="traction-indicator__label">FR</span>
+                            <div class="traction-indicator__bar">
+                                <div class="traction-indicator__bar-fill bar--normal" id="tractionFR" style="width: 80%"></div>
+                            </div>
+                        </div>
+                        <div class="traction-indicator__row">
+                            <span class="traction-indicator__label">RL</span>
+                            <div class="traction-indicator__bar">
+                                <div class="traction-indicator__bar-fill bar--normal" id="tractionRL" style="width: 80%"></div>
+                            </div>
+                        </div>
+                        <div class="traction-indicator__row">
+                            <span class="traction-indicator__label">RR</span>
+                            <div class="traction-indicator__bar">
+                                <div class="traction-indicator__bar-fill bar--normal" id="tractionRR" style="width: 80%"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="traction-status">
+                        <div class="traction-status__dot" id="dscDot" style="background: var(--color-ok)"></div>
+                        <span class="traction-status__text" id="dscStatus" style="color: var(--color-ok)">DSC ON</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: Sidebar -->
+        <div class="sidebar">
+
+            <!-- Lap Times -->
+            <div class="lap-times">
+                <span class="lap-times__title">Track Performance</span>
+                <div class="lap-times__current">
+                    <div class="lap-times__current-label">Current Lap</div>
+                    <div class="lap-times__current-value" id="currentLap">0:00.000</div>
+                    <span class="lap-times__delta lap-times__delta--ahead" id="sectorDelta">+0.000</span>
+                </div>
+                <div class="lap-times__rows">
+                    <div class="lap-times__row">
+                        <span class="lap-times__row-label">Sector</span>
+                        <span class="lap-times__row-value" id="sectorTime">--:--.---</span>
+                    </div>
+                    <div class="lap-times__row">
+                        <span class="lap-times__row-label">Previous</span>
+                        <span class="lap-times__row-value" id="prevLap">--:--.---</span>
+                    </div>
+                    <div class="lap-times__row">
+                        <span class="lap-times__row-label">Best Lap</span>
+                        <span class="lap-times__row-value lap-times__row-value--best" id="bestLap">--:--.---</span>
+                    </div>
+                    <div class="lap-times__row">
+                        <span class="lap-times__row-label">Lap #</span>
+                        <span class="lap-times__row-value" id="lapCount">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- BMW MSS54 Specific Data -->
+            <div class="bmw-data">
+                <span class="bmw-data__title">MSS54 · BMW Specific</span>
+                <div class="bmw-data__grid">
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">VANOS In</span>
+                        <span class="bmw-data__item-value" id="vanosIn">--<span class="bmw-data__item-unit">°</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">VANOS Ex</span>
+                        <span class="bmw-data__item-value" id="vanosEx">--<span class="bmw-data__item-unit">°</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">Knock 1</span>
+                        <span class="bmw-data__item-value" id="knock1">--<span class="bmw-data__item-unit">°r</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">Knock 2</span>
+                        <span class="bmw-data__item-value" id="knock2">--<span class="bmw-data__item-unit">°r</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">Inj Time</span>
+                        <span class="bmw-data__item-value" id="injTime">--<span class="bmw-data__item-unit">ms</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">SMG Hyd</span>
+                        <span class="bmw-data__item-value" id="smgHydP">--<span class="bmw-data__item-unit">bar</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">Clutch</span>
+                        <span class="bmw-data__item-value" id="clutchPos">--<span class="bmw-data__item-unit">%</span></span>
+                    </div>
+                    <div class="bmw-data__item">
+                        <span class="bmw-data__item-label">G-Box</span>
+                        <span class="bmw-data__item-value" id="gboxTemp">--<span class="bmw-data__item-unit">°C</span></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- System Health -->
+            <div class="system-health">
+                <span class="system-health__title">System Health</span>
+                <div class="health-rows">
+                    <div class="health-row health--ok" id="healthEcu">
+                        <span class="health-row__label">DME / ECU</span>
+                        <div class="health-row__status">
+                            <div class="health-row__dot"></div>
+                            <span>OK</span>
+                        </div>
+                    </div>
+                    <div class="health-row health--ok" id="healthSmg">
+                        <span class="health-row__label">SMG Module</span>
+                        <div class="health-row__status">
+                            <div class="health-row__dot"></div>
+                            <span>OK</span>
+                        </div>
+                    </div>
+                    <div class="health-row health--ok" id="healthKline">
+                        <span class="health-row__label">K-Line Bus</span>
+                        <div class="health-row__status">
+                            <div class="health-row__dot"></div>
+                            <span>OK</span>
+                        </div>
+                    </div>
+                    <div class="health-row health--ok" id="healthSensors">
+                        <span class="health-row__label">Sensors</span>
+                        <div class="health-row__status">
+                            <div class="health-row__dot"></div>
+                            <span>OK</span>
+                        </div>
+                    </div>
+                    <div class="health-row health--ok" id="healthDtc">
+                        <span class="health-row__label">DTC Faults</span>
+                        <div class="health-row__status">
+                            <div class="health-row__dot"></div>
+                            <span id="dtcCount">0</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script src="/static/js/telemetry.js"></script>
+</body>
+</html>

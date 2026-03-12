@@ -157,30 +157,140 @@ def diagnose(ctx):
 @cli.command()
 @click.option('--continuous', '-c', is_flag=True, help='Continuously read data')
 @click.option('--interval', '-i', default=1.0, help='Read interval in seconds')
+@click.option('--mode', '-m', type=click.Choice(['ds2', 'obd', 'hybrid']),
+              default='hybrid', help='Protocol mode (default: hybrid)')
 @click.pass_context
-def engine(ctx, continuous, interval):
-    """Read engine data"""
+def engine(ctx, continuous, interval, mode):
+    """Read engine data
+    
+    Modes:
+      ds2    - BMW DS2 protocol only (direct to DME, temps + voltage)
+      obd    - OBD-II PIDs via gateway (RPM, speed, load, throttle)
+      hybrid - Both protocols combined (most complete data)
+    """
+    from .connection import DS2Connection, E46Connection
+    from .engine import get_engine_data_ds2, get_engine_data_obd, get_engine_data_hybrid
+    
+    port = ctx.obj['PORT']
+    
+    def _read_once(ds2_conn=None, obd_conn=None):
+        if mode == 'ds2':
+            return get_engine_data_ds2(ds2_conn)
+        elif mode == 'obd':
+            return get_engine_data_obd(obd_conn)
+        else:  # hybrid
+            return get_engine_data_hybrid(ds2_connection=ds2_conn,
+                                          obd_connection=obd_conn)
+    
+    try:
+        ds2_conn = None
+        obd_conn = None
+        
+        # Open connections based on mode
+        if mode in ('ds2', 'hybrid'):
+            click.echo(f"Opening DS2 connection on {port}...")
+            ds2_conn = DS2Connection(port)
+            ds2_conn.connect()
+        
+        if mode in ('obd', 'hybrid'):
+            # For hybrid: OBD-II uses same physical port but different protocol
+            # The E46Connection will re-init with ISO 9141-2 parameters
+            click.echo(f"Opening OBD-II connection on {port}...")
+            try:
+                obd_conn = E46Connection(port)
+                obd_conn.connect()
+            except Exception as e:
+                if mode == 'hybrid':
+                    click.echo(click.style(
+                        f"OBD-II init failed ({e}) - continuing with DS2 only",
+                        fg='yellow'))
+                    obd_conn = None
+                else:
+                    raise
+        
+        click.echo(f"Mode: {mode.upper()}")
+        click.echo("")
+        
+        if continuous:
+            click.echo("Reading engine data (Ctrl+C to stop)...")
+            try:
+                while True:
+                    data = _read_once(ds2_conn, obd_conn)
+                    click.clear()
+                    click.echo(str(data))
+                    import time
+                    time.sleep(interval)
+            except KeyboardInterrupt:
+                click.echo("\nStopped")
+        else:
+            data = _read_once(ds2_conn, obd_conn)
+            click.echo(str(data))
+        
+        # Clean up
+        if ds2_conn:
+            ds2_conn.disconnect()
+        if obd_conn:
+            obd_conn.disconnect()
+                
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg='red'))
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command()
+@click.pass_context
+def probe(ctx):
+    """Probe all DS2 commands on the DME to discover available data.
+    
+    Sends every known (and some unknown) DS2 command to the DME and
+    reports which ones get a response. Use this to find which commands
+    your specific DME variant supports.
+    """
     from .connection import DS2Connection
-    from .engine import get_engine_data_ds2
+    from .engine import probe_ds2_commands
     
     port = ctx.obj['PORT']
     
     try:
-        with DS2Connection(port) as car:
-            if continuous:
-                click.echo("Reading engine data (Ctrl+C to stop)...")
-                try:
-                    while True:
-                        data = get_engine_data_ds2(car)
-                        click.clear()
-                        click.echo(str(data))
-                        import time
-                        time.sleep(interval)
-                except KeyboardInterrupt:
-                    click.echo("\nStopped")
-            else:
-                data = get_engine_data_ds2(car)
-                click.echo(str(data))
+        click.echo(f"Probing DME on {port} via DS2 protocol...")
+        click.echo("This sends many commands to discover available data.")
+        click.echo("")
+        
+        with DS2Connection(port) as ds2:
+            results = probe_ds2_commands(ds2)
+            
+            click.echo("\n" + "=" * 70)
+            click.echo("DS2 COMMAND PROBE RESULTS")
+            click.echo("=" * 70)
+            
+            responded = {}
+            no_response = []
+            
+            for name, result in results.items():
+                if result is not None:
+                    responded[name] = result
+                else:
+                    no_response.append(name)
+            
+            click.echo(f"\n{len(responded)} commands responded, "
+                       f"{len(no_response)} had no response\n")
+            
+            for name, result in responded.items():
+                click.echo(f"\n{click.style(name, fg='green')} "
+                           f"(cmd {result['command']}"
+                           f"{' ' + result['sub_data'] if result['sub_data'] else ''})")
+                click.echo(f"  Length: {result['response_len']} bytes")
+                click.echo(f"  Hex:   {result['response_hex']}")
+                # Show first 20 bytes as decimal for easier analysis
+                dec = result['response_dec'][:20]
+                suffix = '...' if len(result['response_dec']) > 20 else ''
+                click.echo(f"  Dec:   [{', '.join(str(b) for b in dec)}{suffix}]")
+            
+            if no_response:
+                click.echo(f"\n{click.style('No response:', fg='yellow')} "
+                           f"{', '.join(no_response)}")
                 
     except Exception as e:
         click.echo(click.style(f"Error: {e}", fg='red'))
@@ -489,8 +599,8 @@ def live(ctx, interval, engine_only, smg_only):
     Shows real-time engine and SMG data with continuous updates.
     Press Ctrl+C to stop.
     """
-    from .connection import DS2Connection
-    from .engine import get_engine_data_ds2, get_engine_identification
+    from .connection import DS2Connection, E46Connection
+    from .engine import get_engine_data_ds2, get_engine_data_hybrid, get_engine_identification
     from .smg import get_smg_data_ds2, get_smg_identification
     import time
     import os
@@ -499,6 +609,19 @@ def live(ctx, interval, engine_only, smg_only):
     click.echo(f"Connecting to {port} using DS2 protocol...")
     click.echo("Press Ctrl+C to stop")
     click.echo("")
+    
+    # Try to also open OBD-II connection for hybrid mode
+    obd_conn = None
+    if not smg_only:
+        try:
+            click.echo("Attempting OBD-II gateway connection for hybrid data...")
+            obd_conn = E46Connection(port)
+            obd_conn.connect()
+            click.echo(click.style("OBD-II gateway connected (hybrid mode)", fg='green'))
+        except Exception as e:
+            click.echo(click.style(f"OBD-II init failed: {e}", fg='yellow'))
+            click.echo("Continuing with DS2 only")
+            obd_conn = None
     
     try:
         with DS2Connection(port) as ds2:
@@ -523,6 +646,8 @@ def live(ctx, interval, engine_only, smg_only):
                 else:
                     click.echo(click.style("SMG: Not responding", fg='yellow'))
             
+            mode_str = "HYBRID (DS2 + OBD-II)" if obd_conn else "DS2 ONLY"
+            click.echo(f"\nData Mode: {mode_str}")
             click.echo("")
             
             # Continuous data reading
@@ -531,7 +656,7 @@ def live(ctx, interval, engine_only, smg_only):
                 click.echo("\033[H\033[J", nl=False)  # ANSI clear screen
                 
                 click.echo("=" * 60)
-                click.echo(f"BMW E46 M3 LIVE DATA - {time.strftime('%H:%M:%S')}")
+                click.echo(f"BMW E46 M3 LIVE DATA [{mode_str}] - {time.strftime('%H:%M:%S')}")
                 click.echo("=" * 60)
                 
                 if not smg_only:
@@ -539,7 +664,11 @@ def live(ctx, interval, engine_only, smg_only):
                     click.echo("ENGINE DATA (DME)")
                     click.echo("-" * 30)
                     
-                    engine_data = get_engine_data_ds2(ds2)
+                    if obd_conn:
+                        engine_data = get_engine_data_hybrid(
+                            ds2_connection=ds2, obd_connection=obd_conn)
+                    else:
+                        engine_data = get_engine_data_ds2(ds2)
                     
                     if engine_data.rpm is not None:
                         click.echo(f"  RPM:              {engine_data.rpm:.0f}")
@@ -555,14 +684,20 @@ def live(ctx, interval, engine_only, smg_only):
                         click.echo(f"  Throttle:         {engine_data.throttle_position:.1f}%")
                     if engine_data.speed is not None:
                         click.echo(f"  Speed:            {engine_data.speed:.0f} km/h")
+                    if engine_data.maf is not None:
+                        click.echo(f"  MAF:              {engine_data.maf:.2f} g/s")
                     if engine_data.battery_voltage is not None:
                         click.echo(f"  Battery:          {engine_data.battery_voltage:.1f}V")
+                    if engine_data.timing_advance is not None:
+                        click.echo(f"  Timing Advance:   {engine_data.timing_advance:.1f}°")
                     if engine_data.vanos_intake is not None:
                         click.echo(f"  VANOS Intake:     {engine_data.vanos_intake:.1f}°")
                     if engine_data.vanos_exhaust is not None:
                         click.echo(f"  VANOS Exhaust:    {engine_data.vanos_exhaust:.1f}°")
-                    if engine_data.timing_advance is not None:
-                        click.echo(f"  Timing Advance:   {engine_data.timing_advance:.1f}°")
+                    if engine_data.short_fuel_trim_1 is not None:
+                        click.echo(f"  STFT Bank 1:      {engine_data.short_fuel_trim_1:+.1f}%")
+                    if engine_data.long_fuel_trim_1 is not None:
+                        click.echo(f"  LTFT Bank 1:      {engine_data.long_fuel_trim_1:+.1f}%")
                     
                     # Check if we got any data
                     if all(getattr(engine_data, attr) is None for attr in 
@@ -635,6 +770,37 @@ def gui(ctx):
     port = ctx.obj['PORT']
     click.echo(f"Launching GUI dashboard (port: {port})...")
     launch_gui(port)
+
+
+@cli.command()
+@click.option('--host', default='0.0.0.0', help='Dashboard bind address')
+@click.option('--http-port', default=8046, help='Dashboard HTTP port')
+@click.option('--no-car', is_flag=True, help='Run in demo mode without car connection')
+@click.pass_context
+def dashboard(ctx, host, http_port, no_car):
+    """Launch motorsport telemetry dashboard (web UI)
+    
+    Starts a web server with a professional race-engineering telemetry
+    interface. Open http://localhost:8046 in a browser or on a tablet
+    mounted in the car.
+    
+    Use --no-car for demo mode without a live vehicle connection.
+    """
+    from .dashboard import launch_dashboard
+    
+    serial_port = ctx.obj['PORT']
+    click.echo(f"Starting telemetry dashboard on http://{host}:{http_port}")
+    if no_car:
+        click.echo("Running in DEMO mode (no car connection)")
+    else:
+        click.echo(f"Serial port: {serial_port}")
+    
+    launch_dashboard(
+        host=host,
+        port=http_port,
+        serial_port=serial_port,
+        no_car=no_car,
+    )
 
 
 def main():

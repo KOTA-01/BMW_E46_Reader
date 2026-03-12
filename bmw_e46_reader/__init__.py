@@ -14,12 +14,18 @@ __version__ = '0.1.0'
 __author__ = 'BMW E46 Reader Contributors'
 
 from .connection import E46Connection, DS2Connection
-from .engine import EngineData, get_engine_data_ds2
+from .engine import (
+    EngineData,
+    get_engine_data_ds2,
+    get_engine_data_obd,
+    get_engine_data_hybrid,
+    probe_ds2_commands,
+)
 from .dtc import FaultCode, get_fault_codes, clear_fault_codes
 from .smg import SMGData, get_smg_data_ds2
 from .logger import DataLogger
 
-# Aliases for backward compatibility
+# Default uses hybrid when both connections available, DS2-only otherwise
 get_engine_data = get_engine_data_ds2
 get_smg_data = get_smg_data_ds2
 
@@ -29,6 +35,9 @@ __all__ = [
     'EngineData',
     'get_engine_data',
     'get_engine_data_ds2',
+    'get_engine_data_obd',
+    'get_engine_data_hybrid',
+    'probe_ds2_commands',
     'FaultCode',
     'get_fault_codes',
     'clear_fault_codes',

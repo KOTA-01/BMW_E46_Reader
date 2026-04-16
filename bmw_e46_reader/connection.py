@@ -525,7 +525,12 @@ class DS2Connection:
     LCM = 0xD0      # Light Control Module
     RLS = 0xE8      # Rain/Light Sensor
     
-    def __init__(self, port: str, timeout: float = 0.5):
+    # Inter-byte delay for DS2 writes (seconds).
+    # MSS54 DME requires ~10ms between bytes; burst writes are ignored.
+    # SMG (0x32) tolerates any timing. 10ms is the proven sweet spot.
+    INTER_BYTE_DELAY = 0.010  # 10ms - confirmed by live testing
+    
+    def __init__(self, port: str, timeout: float = 1.5):
         self.port = port
         self.timeout = timeout
         self._serial: Optional[serial.Serial] = None
@@ -551,9 +556,10 @@ class DS2Connection:
                 write_timeout=self.timeout,
             )
             
-            # INPA cable in K-line mode
+            # INPA/K+DCAN cable - DTR low, RTS low
+            # Confirmed working with MSS54 DME + SMG II
+            self._serial.dtr = False
             self._serial.rts = False
-            self._serial.dtr = True
             
             time.sleep(0.1)
             self._serial.reset_input_buffer()
@@ -582,10 +588,13 @@ class DS2Connection:
     
     def _write(self, address: int, payload: bytes) -> None:
         """
-        Send DS2 message.
+        Send DS2 message with inter-byte delay.
         
         Format: [ADDRESS][LENGTH][PAYLOAD...][CHECKSUM]
         Length = address + length byte + payload + checksum
+        
+        The MSS54 DME requires ~10ms between bytes. Sending the full
+        message as a burst causes the DME to silently ignore it.
         """
         length = 2 + len(payload) + 1  # addr + len + payload + checksum
         msg = bytes([address, length]) + payload
@@ -593,7 +602,12 @@ class DS2Connection:
         full_msg = msg + bytes([checksum])
         
         logger.debug(f"DS2 TX: {full_msg.hex()}")
-        self._serial.write(full_msg)
+        
+        # Send byte-by-byte with inter-byte delay
+        for byte in full_msg:
+            self._serial.write(bytes([byte]))
+            time.sleep(self.INTER_BYTE_DELAY)
+        self._serial.flush()
     
     def _read(self) -> Optional[bytes]:
         """
@@ -655,8 +669,14 @@ class DS2Connection:
         self._serial.reset_input_buffer()
         self._write(address, command)
         
+        # Wait for ECU to process (DME needs time after slow byte-by-byte TX)
+        time.sleep(0.05)
+        
         # Read echo (DS2 is half-duplex K-line)
         echo = self._read()
+        
+        # Give ECU time to prepare response
+        time.sleep(0.15)
         
         # Read actual response
         response = self._read()

@@ -181,41 +181,46 @@ def _parse_pid_value(response: bytes, formula: str) -> Optional[float]:
 DS2_CMD_IDENT = 0x00      # ECU identification
 DS2_CMD_BLOCK = 0x04      # Block read (stored data)
 DS2_CMD_FAULTS = 0x07     # Read fault codes
-DS2_CMD_STATUS = 0x0B     # Status data - likely has RPM, speed, load
+DS2_CMD_STATUS = 0x0B     # Status data — REQUIRES group sub-command!
 DS2_CMD_ANALOG = 0x0D     # Analog data (static/calibration)
 DS2_CMD_EXT = 0x0E        # Extended data
-DS2_CMD_RAM = 0x14        # RAM data - LIVE sensor values (temps, voltage)
+DS2_CMD_RAM = 0x14        # RAM data - snapshot values (temps, voltage)
 
-# MSS54 RAM data byte offsets (from command 0x14 0x01 response)
-# Verified by live testing with key on
-# Response: 73 bytes of live sensor data
-MSS54_RAM_MAP = {
-    'counter': 0,          # Counter/status byte (increments)
-    'voltage': 1,          # Battery voltage (raw / 10) = 14.3V CONFIRMED
-    'intake_temp': 2,      # Intake temp (raw - 40) = 28°C CONFIRMED
-    'intake_temp_2': 3,    # Intake temp mirror
-    'oil_temp': 9,         # Oil temperature (raw - 40) = 89°C CONFIRMED
-    'coolant_temp': 25,    # Coolant temperature (raw * 0.75) = 74°C CONFIRMED
-    'live_counter': 27,    # Changes each read (timing counter)
-    'live_counter_2': 51,  # Another live counter
+# ── MSS54 STATUS group 0x02: REAL-TIME live data (updates every read) ──
+# Command: 0x0B 0x02 → 64 bytes of live sensor data
+# CONFIRMED live on MSS54 (S54 engine) by polling during idle.
+MSS54_STATUS_GROUP2 = {
+    'rpm':           (12, 13),  # 16-bit big-endian, direct RPM. 849-851 at idle. CONFIRMED LIVE.
+    'rpm_filtered':  (26, 27),  # 16-bit, filtered/averaged RPM. 838-839 at idle.
+    'rpm_target':    (34, 35),  # 16-bit, target RPM or duplicate. ~850 at idle.
+    'oil_temp_raw':  (18, 19),  # 16-bit, 139-140 at idle -> raw oil sensor
+    'coolant_raw':   (16, 17),  # 16-bit, 82 at idle -> raw coolant sensor
+    'lambda_1':      (54, 55),  # 16-bit, 737-740 at idle -> lambda bank 1
+    'lambda_2':      (56, 57),  # 16-bit, 736-739 at idle -> lambda bank 2
+    'load_raw':      (6, 7),    # 16-bit, 226-236 at idle -> engine load
 }
 
-# DS2 status data (0x0B) candidate byte offsets for RPM/speed/load
-# These need to be verified on a live vehicle - offsets vary by DME variant.
-# MS43 vs MSS54 vs MSS54HP may differ.
-# Common layout from EdiabasLib / INPA research:
-MSS54_STATUS_MAP_CANDIDATES = {
-    # (offset, name, formula_desc) - multiple candidates to probe
-    'rpm_candidates': [
-        (0, 1, '(raw[0] << 8 | raw[1]) * 0.15625'),   # Common: 16-bit, factor 6.4 or /6.4
-        (0, 1, '(raw[0] << 8 | raw[1])'),               # Raw big-endian
-        (2, 3, '(raw[2] << 8 | raw[3])'),               # Alternate position
-        (4, 5, '(raw[4] << 8 | raw[5])'),               # Another candidate
-    ],
-    'speed_candidates': [
-        (6, 'raw[6]'),           # Single byte km/h
-        (6, 7, '(raw[6] << 8 | raw[7]) / 100'),  # 16-bit with divisor
-    ],
+# ── MSS54 STATUS group 0x03: additional live data ──
+# Command: 0x0B 0x03 → 35 bytes
+MSS54_STATUS_GROUP3 = {
+    'rpm':           (0, 1),    # 16-bit RPM, 858-902 at idle (matches group 2)
+    'rpm_target':    (2, 3),    # 16-bit target idle RPM = 870 (constant)
+    'sensor_a':      (4, 5),    # 78-81 at idle (oil-related?)
+    'sensor_b':      (6, 7),    # 993-1032 at idle (fuel-related?)
+    'sensor_c':      (8, 9),    # 204-212 at idle
+}
+
+# ── MSS54 RAM block 1 (0x14 0x01): snapshot data (updates slowly) ──
+# This data updates between sessions but NOT between rapid polls.
+# Good for temps and voltage which don't need 10Hz refresh.
+MSS54_RAM_MAP = {
+    'counter': 0,          # Counter/status byte
+    'voltage': 1,          # Battery voltage: raw / 10.0 -> 14.3V CONFIRMED
+    'intake_temp': 2,      # Intake air temp: raw - 40 -> 28°C CONFIRMED
+    'intake_temp_2': 3,    # Intake temp mirror (same value)
+    'oil_temp': 9,         # Oil temperature: raw - 40 -> 94°C CONFIRMED
+    'coolant_temp': 25,    # Coolant temp: raw * 0.75 -> 74°C CONFIRMED
+    'live_counter': 27,    # Timing counter (changes each read)
 }
 
 
@@ -234,7 +239,7 @@ def _safe_ds2_send(connection: 'DS2Connection', address: int, command: int,
             return response
         elif response:
             logger.debug(f"DS2 {label or f'0x{command:02X}'}: "
-                         f"invalid response (status issue)")
+                         f"invalid response (status 0x{response.status:02X})")
         else:
             logger.debug(f"DS2 {label or f'0x{command:02X}'}: no response")
     except Exception as e:
@@ -242,186 +247,117 @@ def _safe_ds2_send(connection: 'DS2Connection', address: int, command: int,
     return None
 
 
-def _try_parse_rpm_from_status(raw: bytes) -> Optional[float]:
+def _read16(raw: bytes, hi: int, lo: int) -> int:
+    """Read a 16-bit big-endian value from raw bytes at given indices."""
+    return (raw[hi] << 8) | raw[lo]
+
+
+def get_engine_data_ds2(connection: 'DS2Connection', fast: bool = False) -> EngineData:
     """
-    Try to extract real-time RPM from DS2 status (0x0B) response.
+    Read engine parameters from MSS54 DME via DS2 protocol.
     
-    Tries multiple known byte offset / formula combinations used by
-    different MSS54 variants. Returns the first plausible value.
-    """
-    if len(raw) < 2:
-        return None
-    
-    # Strategy: try known formulas at known offsets.
-    # Accept a value if it falls in a sane RPM range (0-9000 for S54).
-    attempts = [
-        # (hi_byte_idx, lo_byte_idx, divisor, description)
-        (0, 1, 1.0, 'bytes 0-1 raw'),
-        (0, 1, 4.0, 'bytes 0-1 / 4 (OBD-II style)'),
-        (0, 1, 6.4, 'bytes 0-1 / 6.4 (INPA style)'),
-        (2, 3, 1.0, 'bytes 2-3 raw'),
-        (2, 3, 4.0, 'bytes 2-3 / 4'),
-        (2, 3, 6.4, 'bytes 2-3 / 6.4'),
-        (4, 5, 1.0, 'bytes 4-5 raw'),
-        (4, 5, 4.0, 'bytes 4-5 / 4'),
-    ]
-    
-    results = []
-    for hi, lo, div, desc in attempts:
-        if len(raw) <= max(hi, lo):
-            continue
-        val = ((raw[hi] << 8) | raw[lo]) / div
-        if 100 < val < 9000:  # plausible RPM range (above cranking, below redline)
-            results.append((val, desc))
-            logger.debug(f"  Status RPM candidate: {val:.0f} via {desc}")
-    
-    if results:
-        # Prefer the value closest to a typical idle (~700-900) if engine is idling,
-        # otherwise just return the first plausible result
-        return results[0][0]
-    return None
-
-
-def _try_parse_speed_from_status(raw: bytes) -> Optional[float]:
-    """Try to extract vehicle speed from DS2 status response."""
-    if len(raw) < 7:
-        return None
-    
-    # Single byte at various offsets
-    for idx in [6, 7, 8, 10, 12]:
-        if len(raw) > idx and 0 < raw[idx] <= 255:
-            # This is tricky - we can't easily distinguish speed from other values
-            # Only return if clearly in a speed-like range (needs live verification)
-            pass
-    
-    # 16-bit speed at common offsets
-    for hi, lo, div in [(6, 7, 100.0), (8, 9, 100.0)]:
-        if len(raw) > max(hi, lo):
-            val = ((raw[hi] << 8) | raw[lo]) / div
-            if 0 < val < 300:  # plausible speed range km/h
-                logger.debug(f"  Status speed candidate: {val:.1f} km/h @ bytes {hi}-{lo}")
-                return val
-    return None
-
-
-def get_engine_data_ds2(connection: 'DS2Connection') -> EngineData:
-    """
-    Read all available engine parameters using DS2 protocol.
-    
-    Tries multiple DS2 commands in priority order:
-      1. 0x0B (status) - most likely to have real-time RPM, speed, load
-      2. 0x14 (RAM) - confirmed live temps, voltage
-      3. 0x0D (analog) - additional sensor data
-      4. 0x0E (extended) - probe for more data
-      5. 0x14 with sub-commands 0x00..0x03 - alternate RAM blocks
+    Uses two complementary commands:
+      1. 0x0B 0x02 (STATUS group 2) — REAL-TIME RPM, load, lambda
+         Updates every single read at full polling speed.
+      2. 0x14 0x01 (RAM block 1) — temps, voltage (snapshot)
+         Updates slowly but contains confirmed temp/voltage data.
     
     Args:
         connection: Active DS2Connection
+        fast: If True, only read STATUS_G2 for RPM (skip temps/voltage).
+              Use for high-frequency RPM polling.
         
     Returns:
         EngineData object with current values
     """
     data = EngineData()
     
-    # ── 1. DS2 Status (0x0B) ── likely has real-time RPM / speed / load ──
+    # ── 1. STATUS group 0x02: REAL-TIME RPM + live data ──
+    # This is the primary live data source. Updates every single read.
     try:
-        response = _safe_ds2_send(connection, 0x12, DS2_CMD_STATUS, label='STATUS')
-        if response and len(response.data) >= 2:
-            raw = response.data
-            logger.info(f"DME STATUS data ({len(raw)} bytes): {raw.hex()}")
+        response = _safe_ds2_send(connection, 0x12, DS2_CMD_STATUS,
+                                   bytes([0x02]), label='STATUS_G2')
+        if response and len(response.data) >= 28:
+            # DS2 response.data includes leading ack byte (0xA0) — skip it.
+            # The actual sensor payload starts at data[1].
+            raw = response.data[1:]
             
-            # Try to extract RPM from status
-            rpm = _try_parse_rpm_from_status(raw)
-            if rpm is not None:
-                data.rpm = rpm
-                logger.info(f"Got RPM from DS2 status: {rpm:.0f}")
+            # RPM at bytes [12:13] — direct 16-bit, ~850 at idle. CONFIRMED LIVE.
+            hi, lo = MSS54_STATUS_GROUP2['rpm']
+            rpm_raw = _read16(raw, hi, lo)
+            if 0 < rpm_raw < 10000:
+                data.rpm = float(rpm_raw)
+                logger.debug(f"RPM = {data.rpm:.0f}")
             
-            # Try to extract speed from status
-            speed = _try_parse_speed_from_status(raw)
-            if speed is not None:
-                data.speed = speed
-                logger.info(f"Got speed from DS2 status: {speed:.1f} km/h")
+            # Engine load from [6:7]
+            hi, lo = MSS54_STATUS_GROUP2['load_raw']
+            load_raw = _read16(raw, hi, lo)
+            if load_raw > 0:
+                data.engine_load = load_raw / 10.0  # tentative scaling
+                logger.debug(f"Load raw = {load_raw}")
+            
+            # Lambda sensors from [54:55] and [56:57]
+            if len(raw) >= 58:
+                hi, lo = MSS54_STATUS_GROUP2['lambda_1']
+                lam1 = _read16(raw, hi, lo)
+                if lam1 > 0:
+                    data.lambda_sensor_1 = lam1 / 1000.0
+                    logger.debug(f"Lambda 1 = {data.lambda_sensor_1:.3f}")
+                hi, lo = MSS54_STATUS_GROUP2['lambda_2']
+                lam2 = _read16(raw, hi, lo)
+                if lam2 > 0:
+                    data.lambda_sensor_2 = lam2 / 1000.0
+                    logger.debug(f"Lambda 2 = {data.lambda_sensor_2:.3f}")
     except Exception as e:
-        logger.warning(f"DS2 STATUS error: {e}")
+        logger.warning(f"DS2 STATUS_G2 error: {e}")
     
-    # ── 2. DS2 RAM (0x14 0x01) ── confirmed for temps + voltage ──
-    try:
-        response = _safe_ds2_send(connection, 0x12, DS2_CMD_RAM, bytes([0x01]),
-                                   label='RAM 0x01')
-        if response and len(response.data) >= 30:
-            raw = response.data
-            logger.debug(f"DME RAM data ({len(raw)} bytes): {raw.hex()}")
-            
-            # RPM from RAM bytes 0-1 (idle target RPM, fallback only)
-            if data.rpm is None:
-                rpm_raw = (raw[0] << 8) | raw[1]
-                if 0 < rpm_raw < 10000:
-                    data.rpm = rpm_raw
-                    logger.debug(f"RPM (idle target fallback) = {rpm_raw}")
-            
-            # Coolant temp at byte 25 (raw * 0.75 formula for MSS54)
-            if len(raw) > 25 and raw[25] != 0xFF:
-                data.coolant_temp = raw[25] * 0.75
-                logger.debug(f"Coolant temp = {data.coolant_temp}°C")
-            
-            # Intake temp at byte 2 (raw - 40)
-            if raw[2] != 0xFF:
-                data.intake_temp = raw[2] - 40
-                logger.debug(f"Intake temp = {data.intake_temp}°C")
-            
-            # Oil temp at byte 9 (raw - 40)
-            if raw[9] != 0xFF:
-                data.oil_temp = raw[9] - 40
-                logger.debug(f"Oil temp = {data.oil_temp}°C")
-            
-            # Battery voltage at byte 1 (raw / 10)
-            if raw[1] != 0xFF:
-                data.battery_voltage = raw[1] / 10.0
-                logger.debug(f"Battery voltage = {data.battery_voltage}V")
-    except Exception as e:
-        logger.warning(f"DS2 RAM error: {e}")
-    
-    # ── 3. DS2 RAM alternate sub-commands (0x00, 0x02, 0x03) ──
-    # Some DME variants expose different data in different RAM blocks
-    for sub_cmd in [0x00, 0x02, 0x03]:
-        # Only query additional blocks if we're still missing key data
-        if data.rpm is not None and data.coolant_temp is not None:
-            break
+    # ── 2. STATUS group 0x03: RPM fallback + target idle ──
+    if data.rpm is None and not fast:
         try:
-            response = _safe_ds2_send(connection, 0x12, DS2_CMD_RAM,
-                                       bytes([sub_cmd]),
-                                       label=f'RAM 0x{sub_cmd:02X}')
-            if response and len(response.data) >= 10:
-                raw = response.data
-                logger.info(f"DME RAM 0x{sub_cmd:02X} ({len(raw)} bytes): {raw.hex()}")
-                
-                # Try RPM extraction if still missing
-                if data.rpm is None and len(raw) >= 2:
-                    rpm_raw = (raw[0] << 8) | raw[1]
-                    if 100 < rpm_raw < 10000:
-                        data.rpm = rpm_raw
-                        logger.info(f"RPM from RAM 0x{sub_cmd:02X}: {rpm_raw}")
+            response = _safe_ds2_send(connection, 0x12, DS2_CMD_STATUS,
+                                       bytes([0x03]), label='STATUS_G3')
+            if response and len(response.data) >= 4:
+                raw = response.data[1:]  # skip ack byte
+                hi, lo = MSS54_STATUS_GROUP3['rpm']
+                rpm_raw = _read16(raw, hi, lo)
+                if 0 < rpm_raw < 10000:
+                    data.rpm = float(rpm_raw)
+                    logger.debug(f"RPM (G3 fallback) = {data.rpm:.0f}")
         except Exception as e:
-            logger.debug(f"DS2 RAM 0x{sub_cmd:02X} error: {e}")
+            logger.debug(f"DS2 STATUS_G3 error: {e}")
     
-    # ── 4. DS2 Analog (0x0D) ── may have additional sensor data ──
-    try:
-        response = _safe_ds2_send(connection, 0x12, DS2_CMD_ANALOG, label='ANALOG')
-        if response and len(response.data) >= 10:
-            raw = response.data
-            logger.debug(f"DME ANALOG data ({len(raw)} bytes): {raw.hex()}")
-            # Analog data is typically calibration/static, but log for discovery
-    except Exception as e:
-        logger.debug(f"DS2 ANALOG error: {e}")
-    
-    # ── 5. DS2 Extended (0x0E) ── probe for more data ──
-    try:
-        response = _safe_ds2_send(connection, 0x12, DS2_CMD_EXT, label='EXTENDED')
-        if response and len(response.data) >= 4:
-            raw = response.data
-            logger.debug(f"DME EXT data ({len(raw)} bytes): {raw.hex()}")
-    except Exception as e:
-        logger.debug(f"DS2 EXT error: {e}")
+    # ── 3. RAM block 1 (0x14 0x01): temps + voltage (snapshot) ──
+    # These update between sessions/slowly, not every poll.
+    # Still the best source for calibrated temps and battery voltage.
+    # Skip in fast mode — temps don't need high-frequency updates.
+    if not fast:
+        try:
+            response = _safe_ds2_send(connection, 0x12, DS2_CMD_RAM, bytes([0x01]),
+                                       label='RAM_BLK1')
+            if response and len(response.data) >= 27:
+                raw = response.data[1:]  # skip ack byte
+                
+                # Battery voltage at byte 1: raw / 10.0
+                if raw[MSS54_RAM_MAP['voltage']] != 0xFF:
+                    data.battery_voltage = raw[MSS54_RAM_MAP['voltage']] / 10.0
+                    logger.debug(f"Battery = {data.battery_voltage:.1f}V")
+                
+                # Intake temp at byte 2: raw - 40
+                if raw[MSS54_RAM_MAP['intake_temp']] != 0xFF:
+                    data.intake_temp = raw[MSS54_RAM_MAP['intake_temp']] - 40
+                    logger.debug(f"Intake = {data.intake_temp}°C")
+                
+                # Oil temp at byte 9: raw - 40
+                if raw[MSS54_RAM_MAP['oil_temp']] != 0xFF:
+                    data.oil_temp = raw[MSS54_RAM_MAP['oil_temp']] - 40
+                    logger.debug(f"Oil = {data.oil_temp}°C")
+                
+                # Coolant at byte 25: raw * 0.75
+                if raw[MSS54_RAM_MAP['coolant_temp']] != 0xFF:
+                    data.coolant_temp = raw[MSS54_RAM_MAP['coolant_temp']] * 0.75
+                    logger.debug(f"Coolant = {data.coolant_temp:.1f}°C")
+        except Exception as e:
+            logger.warning(f"DS2 RAM error: {e}")
     
     return data
 

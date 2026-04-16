@@ -214,10 +214,12 @@ def get_smg_data_ds2(connection: 'DS2Connection') -> SMGData:
     
     try:
         # Read analog data (command 0x0D) - 72 bytes
+        # This is the primary SMG data source: gear, shift mode, gearbox temp.
         response = connection.send(SMG_ECU_ADDR, DS2_CMD_ANALOG)
         
-        if response and response.valid and len(response.data) >= 47:
-            raw = response.data
+        if response and response.valid and len(response.data) >= 48:
+            # DS2 response includes leading ack byte (0xA0) — skip it.
+            raw = response.data[1:]
             logger.debug(f"SMG analog data ({len(raw)} bytes): {raw.hex()}")
             
             # Gear position at byte 0 (only updates with engine running)
@@ -237,45 +239,6 @@ def get_smg_data_ds2(connection: 'DS2Connection') -> SMGData:
                 if temp_byte != 0xFF:
                     data.gearbox_temp = temp_byte - 40
                     logger.debug(f"SMG gearbox temp = {data.gearbox_temp}°C (raw: {temp_byte})")
-                    
-        # Also read block 0 for additional status
-        response = connection.send(SMG_ECU_ADDR, DS2_CMD_BLOCK, bytes([0x00]))
-        
-        if response and response.valid and len(response.data) > 3:
-            raw = response.data
-            logger.debug(f"SMG block 0 data: {raw.hex()}")
-            
-            # Status byte often at position 0
-            status_byte = raw[0]
-            
-            # Gear is often in lower nibble of a byte
-            for i, b in enumerate(raw[:5]):
-                if (b & 0x0F) <= 7:  # Valid gear value
-                    gear_val = b & 0x0F
-                    if gear_val > 0 or i > 0:  # Skip first byte if 0
-                        data.gear = _parse_gear(gear_val)
-                        break
-            
-            # NOTE: Block 0 contains ASCII status "-N-N", NOT temperature
-            # Temperature is read from Status command (0x0B) byte 3
-                    
-        # Read status command for pump and clutch info
-        # Note: Status command (0x0B) returns 0xB0 "busy" on SMG, limited data available
-        response = connection.send(SMG_ECU_ADDR, DS2_CMD_STATUS)
-        
-        if response and response.valid and len(response.data) > 2:
-            raw = response.data
-            logger.debug(f"SMG status data: {raw.hex()}")
-            
-            # Try to find pump status bit
-            if len(raw) > 0:
-                data.pump_running = bool(raw[0] & 0x10)  # Typical bit position
-                
-            # Clutch position if available
-            if len(raw) > 2:
-                clutch = raw[2]
-                if clutch != 0xFF:
-                    data.clutch_position = clutch * 100.0 / 255.0
                     
     except Exception as e:
         logger.error(f"Error reading SMG data: {e}")

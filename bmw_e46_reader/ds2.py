@@ -104,9 +104,11 @@ class DS2Connection:
     """
     
     # Standard BMW DS2 timings
-    INTER_BYTE_TIME = 0.005     # 5ms between bytes (P4 timing)
-    RESPONSE_TIMEOUT = 1.0     # Timeout waiting for response
-    INTER_MSG_TIME = 0.050     # 50ms minimum between messages
+    # MSS54 DME requires ~10ms inter-byte delay; 5ms gets short/rejected responses.
+    # Confirmed by live testing: 10-20ms works, <5ms and >30ms fail.
+    INTER_BYTE_TIME = 0.010     # 10ms between bytes (required for MSS54)
+    RESPONSE_TIMEOUT = 0.5      # Timeout waiting for response
+    INTER_MSG_TIME = 0.010      # 10ms minimum between messages
     
     def __init__(
         self,
@@ -166,23 +168,12 @@ class DS2Connection:
                 logger.success(f"DS2: DME responded! Data: {test.data.hex()}")
                 return True
             else:
-                logger.warning("DS2: DME didn't respond - trying alternate settings")
-                
-                # Try with no parity
-                self._serial.parity = serial.PARITY_NONE
-                test = self.send(DS2ECUAddress.DME, DS2Service.IDENT, timeout=0.5)
-                if test and test.valid:
-                    logger.success(f"DS2: DME responded (no parity)! Data: {test.data.hex()}")
-                    return True
-                    
-                # Try with DTR high
-                self._serial.dtr = True
-                test = self.send(DS2ECUAddress.DME, DS2Service.IDENT, timeout=0.5)
-                if test and test.valid:
-                    logger.success(f"DS2: DME responded (DTR high)! Data: {test.data.hex()}")
-                    return True
-                
-                logger.warning("DS2: No ECU response - connection may still work")
+                logger.warning("DS2: DME didn't respond to ident probe - continuing anyway")
+                # Always ensure correct settings for MSS54:
+                # EVEN parity, DTR=False, RTS=False
+                self._serial.parity = serial.PARITY_EVEN
+                self._serial.dtr = False
+                self._serial.rts = False
                 return True  # Port is open, ECU may respond to other commands
                 
         except serial.SerialException as e:
@@ -229,9 +220,9 @@ class DS2Connection:
         timeout = timeout or self.timeout
         
         # Build message: [ADDRESS] [LENGTH] [SERVICE] [DATA...] [CHECKSUM]
-        # LENGTH includes itself + service + data (NOT address, NOT checksum)
+        # LENGTH = total message size (addr + len + payload + checksum)
         payload = bytes([service]) + data
-        length = len(payload) + 1  # +1 for length byte itself
+        length = len(payload) + 3  # +3 for address, length byte, checksum
         
         msg = bytes([address, length]) + payload
         checksum = self.calc_checksum(msg)
@@ -258,9 +249,17 @@ class DS2Connection:
             self._serial.flush()
             self._last_comm_time = time.time()
             
-            # Wait for response
-            time.sleep(0.05)  # Small initial delay
+            # K-line is half-duplex: cable echoes back everything we send.
+            # Read and discard the echo before reading the ECU response.
+            # Echo arrives at wire speed (~1ms/byte at 9600), use short timeout.
+            old_timeout = self._serial.timeout
+            self._serial.timeout = 0.05  # 50ms is plenty for echo
+            echo = self._serial.read(len(msg))
+            self._serial.timeout = old_timeout
+            if len(echo) != len(msg):
+                logger.debug(f"DS2: Echo incomplete ({len(echo)}/{len(msg)} bytes)")
             
+            # Go straight to response read — _receive_response handles timeout
             return self._receive_response(timeout)
             
         except Exception as e:
@@ -296,21 +295,24 @@ class DS2Connection:
             logger.warning(f"DS2: Invalid length: {length}")
             return None
             
-        # Read data + checksum
-        # Length includes itself, so we need (length - 1) more bytes for data
-        # Plus 1 byte for checksum
-        data_len = length - 1  # Data bytes
+        # Read remaining bytes: length = total msg size (addr + len + payload + cs)
+        # We already read addr(1) + len(1), so remaining = length - 2
+        remaining = length - 2
+        if remaining < 1:
+            logger.warning(f"DS2: Length too small: {length}")
+            return None
+        
         remaining_timeout = timeout - (time.time() - start_time)
         self._serial.timeout = max(0.1, remaining_timeout)
         
-        rest = self._serial.read(data_len + 1)  # +1 for checksum
+        rest = self._serial.read(remaining)
         
-        if len(rest) < data_len + 1:
-            logger.debug(f"DS2: Incomplete response (got {len(rest)}, expected {data_len + 1})")
+        if len(rest) < remaining:
+            logger.debug(f"DS2: Incomplete response (got {len(rest)}, expected {remaining})")
             return None
             
-        data = rest[:data_len]
-        checksum = rest[data_len]
+        data = rest[:-1]   # Everything except last byte
+        checksum = rest[-1] # Last byte is checksum
         
         # Verify checksum
         msg_bytes = bytes([address, length]) + data

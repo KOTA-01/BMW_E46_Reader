@@ -83,13 +83,13 @@ class TelemetryBridge:
         logger.info("Telemetry polling stopped")
     
     def _connect(self) -> bool:
-        """Attempt to connect to the vehicle."""
+        """Attempt to connect to the vehicle via DS2 protocol."""
         try:
-            from ..connection import E46Connection
-            self.connection = E46Connection(self.serial_port)
+            from ..ds2 import DS2Connection
+            self.connection = DS2Connection(self.serial_port)
             self.connection.connect()
             self._health['kline'] = {'status': 'ok', 'text': 'OK'}
-            logger.info(f"Connected to vehicle on {self.serial_port}")
+            logger.info(f"DS2 connected on {self.serial_port}")
             return True
         except Exception as e:
             self._health['kline'] = {'status': 'error', 'text': str(e)[:20]}
@@ -106,8 +106,15 @@ class TelemetryBridge:
             self.connection = None
     
     def _poll_loop(self):
-        """Main polling loop — reads engine and SMG data continuously."""
-        from ..engine import get_engine_data
+        """Main polling loop — reads engine and SMG data continuously.
+        
+        Uses fast/slow cycling for responsiveness:
+        - Every cycle: STATUS_G2 only (RPM, load, lambda) — 1 serial command
+        - Every 10th cycle: full data (temps, voltage, SMG) — 3 serial commands
+        
+        Target: ~5 Hz RPM updates on fast cycles.
+        """
+        from ..engine import get_engine_data_ds2
         from ..smg import get_smg_data
         
         if not self._connect():
@@ -116,26 +123,47 @@ class TelemetryBridge:
             return
         
         consecutive_errors = 0
+        cycle_count = 0
+        
+        # Cached slow-poll data (temps, voltage, SMG)
+        cached_temps = {}   # battery_voltage, intake_temp, oil_temp, coolant_temp
+        cached_smg = {}
         
         while self._running:
             try:
-                engine_data = get_engine_data(self.connection)
+                is_full_cycle = (cycle_count % 10 == 0)
+                
+                # Fast mode: only RPM/load/lambda (1 serial command)
+                # Full mode: RPM + temps + voltage (2 serial commands)
+                engine_data = get_engine_data_ds2(self.connection, fast=not is_full_cycle)
                 engine_dict = engine_data.to_dict()
                 
-                smg_dict = {}
-                try:
-                    smg_data = get_smg_data(self.connection)
-                    smg_dict = smg_data.to_dict()
-                    self._health['smg'] = {'status': 'ok', 'text': 'OK'}
-                except Exception as e:
-                    self._health['smg'] = {'status': 'warn', 'text': str(e)[:20]}
+                # On full cycles, cache the temp/voltage data
+                if is_full_cycle:
+                    for key in ('battery_voltage', 'intake_temp', 'oil_temp', 'coolant_temp'):
+                        if engine_dict.get(key) is not None:
+                            cached_temps[key] = engine_dict[key]
+                
+                # Always merge cached temps into fast-poll results
+                for key, val in cached_temps.items():
+                    if engine_dict.get(key) is None:
+                        engine_dict[key] = val
+                
+                # SMG: read only on full cycles (gear changes are infrequent)
+                if is_full_cycle:
+                    try:
+                        smg_data = get_smg_data(self.connection)
+                        cached_smg = smg_data.to_dict()
+                        self._health['smg'] = {'status': 'ok', 'text': 'OK'}
+                    except Exception as e:
+                        self._health['smg'] = {'status': 'warn', 'text': str(e)[:20]}
                 
                 # Package the telemetry frame
                 frame = {
                     'engine': engine_dict,
-                    'smg': smg_dict,
+                    'smg': cached_smg,
                     'health': self._health,
-                    'gforce_lat': 0,    # Populated if IMU is available
+                    'gforce_lat': 0,
                     'gforce_lon': 0,
                     'dsc_active': True,
                     'traction': {},
@@ -151,7 +179,8 @@ class TelemetryBridge:
                 self._health['ecu'] = {'status': 'ok', 'text': 'OK'}
                 self._health['sensors'] = {'status': 'ok', 'text': 'OK'}
                 
-                time.sleep(0.1)  # ~10 Hz target
+                cycle_count += 1
+                # No sleep — serial I/O is the natural rate limiter
                 
             except Exception as e:
                 consecutive_errors += 1

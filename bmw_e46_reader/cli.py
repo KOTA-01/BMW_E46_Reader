@@ -446,10 +446,10 @@ def info(ctx):
         sys.exit(1)
 
 
-@cli.command()
+@cli.command('dashboard_text')
 @click.pass_context
-def dashboard(ctx):
-    """Live dashboard display"""
+def dashboard_text(ctx):
+    """Live dashboard display (text-mode, legacy)"""
     from .connection import E46Connection
     from .engine import get_engine_data
     from .smg import get_smg_data
